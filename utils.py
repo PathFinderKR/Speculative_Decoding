@@ -8,7 +8,6 @@ import numpy as np
 from typing import List, Dict, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
-from transformers.cache_utils import DynamicCache
 
 class BitNet:
     def __init__(
@@ -30,7 +29,7 @@ class BitNet:
         self.pad_token = "<|pad|>"
         self.model = None
         self.model_id = model_id
-        self.dtype = torch.float32
+        self.dtype = torch.bfloat16
         self.model_path = quantized_path
         self.host = host
         self.port = int(port)
@@ -131,12 +130,6 @@ class BitNet:
         input_ids = input_ids + assistant_response
         return input_ids
 
-    def add_user(self, content: str):
-        self.messages.append({"role": "user", "content": content})
-
-    def add_assistant(self, content: str):
-        self.messages.append({"role": "assistant", "content": content})
-
     @torch.no_grad()
     def generate_hf(
             self,
@@ -170,7 +163,7 @@ class BitNet:
             do_sample=False,
             use_cache=False,
             # cache_implementation="quantized",
-            assistant_model=quantized_model if speculative else None,
+            assistant_model=quantized_model,
             num_assistant_tokens=num_assistant_tokens,
             assistant_confidence_threshold=assistant_confidence_threshold,
             streamer=self.streamer if stream else None,
@@ -260,7 +253,7 @@ class BitNet:
             if verbose:
                 timings = response_data.get('timings', {})
                 print("\n\033[95m" + "─" * 50)
-                print("🧠 Generation Info")
+                print("🧠 Generation Info (BitNet GGUF)")
                 print("─" * 50 + "\033[0m")
                 print(f"\033[94m💬 User Input:\033[0m\n{response_data.get('prompt', text)}")
                 print(f"\n\033[92m🟢 Generated Text:\033[0m\n{content}")
@@ -288,235 +281,163 @@ class BitNet:
             print(f"Error during API request: {e}")
 
     @torch.no_grad()
-    def verify_hf(
-            self,
-            input_ids: torch.Tensor,
-            num_verify: int,
-            confidence_threshold: float = 0.4,
-            past_key_values: Optional[tuple] = None,
-            verbose: bool = False
-    ):
-        # 1. Forward pass with KV cache
-        outputs = self.model(input_ids, past_key_values=past_key_values, use_cache=True)
-        logits = outputs.logits
-        new_past_key_values = outputs.past_key_values
-
-        # 2. Probabilities for verification
-        # Logits for the tokens we are verifying (all but the very first input token)
-        verify_logits = logits[0, :-1, :]
-        probs = torch.softmax(verify_logits, dim=-1)
-        # The actual token IDs that were generated and need verification
-        verify_token_ids = input_ids[0, 1:]
-
-        if verbose:
-            full_sequence_ids = (
-                torch.cat([past_kv[0][0, 0, :, 0] for past_kv in past_key_values], dim=0).long()
-                if past_key_values is not None
-                else torch.tensor([])
-            )
-            total_len = len(full_sequence_ids) + len(verify_token_ids)
-            print("\n" + "─" * 60)
-            header = f"| {'Step':>4s} | {'Token':<15s} | {'Probability':>12s} | {'Status':<10s} |"
-            print(header)
-            print(f"|{'-' * 6}|{'-' * 17}|{'-' * 14}|{'-' * 12}|")
-
-        accepted = True
-        results = []
-        for i in range(num_verify):
-            token_id = verify_token_ids[i]
-            token_prob = probs[i, token_id].item()
-
-            if accepted and token_prob >= confidence_threshold:
-                status = "Accepted"
-                status_color = "\033[92m"
-            else:
-                accepted = False
-                status = "Rejected"
-                status_color = "\033[91m"
-
-            token_str = self.tokenizer.decode(token_id).replace('\n', '\\n')
-            results.append({"token": token_str, "prob": token_prob, "status": status})
-
-            if verbose:
-                print(
-                    f"| {total_len - num_verify + i + 1:>4d} | {token_str:<15.15s} | {token_prob:>12.2%} | {status_color}{status:<10s}\033[0m |")
-
-        if verbose:
-            print("─" * 60)
-
-        return results, new_past_key_values
-
-    @torch.no_grad()
     def speculative_decoding(
             self,
             text: str,
             max_new_tokens: int = 128,
-            temperature: float = 1.0,
-            top_p: float = 1.0,
-            top_k: int = 0,
             num_assistant_tokens: int = 4,
             confidence_threshold: float = 0.4,
+            seed: int = 42,
             verbose: bool = False,
     ):
-        full_generated_text = ""
-        current_text_for_draft = text
-        n_generated = 0
-        step = 1
-        total_accepted_tokens = 0
-        total_drafted_tokens = 0
-        total_time_start = time.time()
-
         if verbose:
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
-            print("✨ Starting Speculative Decoding (KV Cache Optimized)")
+            print("✨ Speculative Decoding")
             print(f"├─ Target Model: {self.model_id}")
             print(f"├─ Draft Model: {self.model_path}")
             print(f"└─ Draft Length: {num_assistant_tokens}, Confidence: {confidence_threshold:.1f}")
             print("\033[95m" + "─" * 50 + "\033[0m")
 
-        # Initial prefill for the verification model's KV cache
-        initial_input_ids = self.tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids.to(self.model.device)
-        outputs = self.model(initial_input_ids, use_cache=True)
-        past_key_values = outputs.past_key_values
-        last_token_id = initial_input_ids[:, -1:]
+        start_time = time.time()
+        step = 1
+        total_draft_tokens = 0
+        total_accepted_draft_tokens = 0
 
-        while n_generated < max_new_tokens:
-            # 1. Draft Generation (Fast Model)
-            remaining_tokens = max_new_tokens - n_generated
-            draft_len = min(num_assistant_tokens, remaining_tokens)
+        # Initial prompt
+        prompt_tokens = self.tokenizer(
+            text,
+            return_tensors="pt",
+            add_special_tokens=False
+        ).input_ids.to(self.model.device)
+        generated_token_ids = []
+        past_key_values = None
 
-            if verbose:
-                print(f"\n\033[95m--------------- Step {step} ---------------\033[0m")
-                print(f"📝 \033[94mDraft Input:\033[0m {current_text_for_draft.strip()}")
+        # Generation loop
+        while len(generated_token_ids) < max_new_tokens:
+            current_input_ids = torch.cat([
+                prompt_tokens,
+                torch.tensor([generated_token_ids], dtype=torch.long, device=self.model.device)
+            ], dim=-1)
+            current_text = self.tokenizer.decode(current_input_ids[0])
 
+            # 1. Draft Generation
             draft_text = self.generate_gguf(
-                text=current_text_for_draft,
-                max_new_tokens=draft_len,
-                temperature=temperature, top_p=top_p, top_k=top_k,
+                text=current_text,
+                max_new_tokens=num_assistant_tokens,
+                temperature=0.0,
+                top_p=1.0,
+                min_p=0.0,
+                top_k=0,
+                seed=seed,
                 verbose=False,
             )
+            draft_ids = self.tokenizer(
+                draft_text,
+                return_tensors="pt",
+                add_special_tokens=False
+            ).input_ids[0].to(self.model.device)
 
-            draft_token_ids = self.tokenizer.encode(draft_text, add_special_tokens=False)
-            num_draft_tokens = len(draft_token_ids)
-            total_drafted_tokens += num_draft_tokens
-
-            if num_draft_tokens == 0:
+            if len(draft_ids) == 0:
                 if verbose: print("⚠️ Draft model produced no new tokens. Stopping.")
                 break
+            total_draft_tokens += len(draft_ids)
 
-            if verbose:
-                print(f"🚀 \033[93mDraft Generated:\033[0m {draft_text.strip()} ({num_draft_tokens} tokens)")
-
-            # 2. Verification (Accurate Model)
-            draft_ids_tensor = torch.tensor(draft_token_ids, dtype=torch.long, device=self.model.device).unsqueeze(0)
-            verification_input_ids = torch.cat([last_token_id, draft_ids_tensor], dim=1)
-
-            verification_results, past_key_values = self.verify_hf(
-                input_ids=verification_input_ids,
-                num_verify=num_draft_tokens,
-                confidence_threshold=confidence_threshold,
+            # 2. Target Verification
+            verification_ids = torch.cat([
+                current_input_ids,
+                draft_ids.unsqueeze(0)
+            ], dim=-1)
+            outputs = self.model(
+                input_ids=verification_ids,
                 past_key_values=past_key_values,
-                verbose=verbose,
+                use_cache=True
             )
-
-            # 3. Accept/Reject Logic
-            n_accepted = 0
-            for result in verification_results:
-                if result["status"] == "Accepted":
-                    n_accepted += 1
-                else:
-                    break
-
-            total_accepted_tokens += n_accepted
-            accepted_ids = draft_token_ids[:n_accepted]
-            accepted_text = self.tokenizer.decode(accepted_ids)
+            logits = outputs.logits
+            past_key_values = outputs.past_key_values
 
             if verbose:
-                print(f"✅ \033[92mAccepted {n_accepted} tokens:\033[0m {accepted_text.strip()}")
+                print("\n" + "\033[95m" + "-" * 10 + f"Step {step}" + "-" * 10 + "\033[0m")
+                print(f"\033[94mDraft Input:\033[0m\n{current_text}")
+                print(f"\033[94mDraft Output\033[0m\n{self.tokenizer.decode(draft_ids.tolist(), skip_special_tokens=False)}")
+                print(f"┌{'─'*5}┬{'─'*17}┬{'─'*14}┬{'─'*20}┬{'─'*17}┐")
+                print(f"│ {'Idx':<3s} │ {'Draft Token':<15s} │ {'Target Prob':>12s} │ {'Status':<18s} │ {'Corrected':<15s} │")
+                print(f"├{'─'*5}┼{'─'*17}┼{'─'*14}┼{'─'*20}┼{'─'*17}┤")
 
-            current_text_for_draft += accepted_text
-            full_generated_text += accepted_text
-            n_generated += n_accepted
+            accepted_count = 0
+            for i in range(len(draft_ids)):
+                # 1. Probabilities
+                target_logit = logits[:, current_input_ids.shape[-1] + i - 1, :]
+                probs = torch.softmax(target_logit, dim=-1)
 
-            if n_generated >= max_new_tokens: break
+                draft_token_id = draft_ids[i]
+                draft_token_prob = probs[0, draft_token_id].item()
+                draft_token_str = self.tokenizer.decode(draft_token_id).replace('\n', '\\n')
 
-            # If not all draft tokens were accepted, perform a correction step
-            if n_accepted < num_draft_tokens:
-                if verbose: print("🤔 \033[91mPerforming correction step...\033[0m")
+                # 2. Accept/Reject
+                if draft_token_prob >= confidence_threshold:
+                    accepted_count += 1
+                    if verbose:
+                        status = "\033[92m✅ Accepted\033[0m"
+                        corrected_str = "-"
+                        print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>11.2%} │ {status:<28s} │ {corrected_str:<15s} │")
 
-                # Rewind KV cache to the point of the last accepted token
-                if n_accepted > 0:
-                    last_accepted_id = torch.tensor([[accepted_ids[n_accepted-1]]], dtype=torch.long, device=self.model.device)
-                    num_rejected = num_draft_tokens - n_accepted
-                    new_cache = DynamicCache()
-                    for layer_idx, (k, v) in enumerate(past_key_values):
-                        new_k = k[:, :, :-num_rejected, :]
-                        new_v = v[:, :, :-num_rejected, :]
-                        new_cache.update(new_k, new_v, layer_idx)
-                    past_key_values = new_cache
-                else: # n_accepted == 0
-                    last_accepted_id = last_token_id
-                    new_cache = DynamicCache()
-                    for layer_idx, (k, v) in enumerate(past_key_values):
-                        new_k = k[:, :, :-num_draft_tokens, :]
-                        new_v = v[:, :, :-num_draft_tokens, :]
-                        new_cache.update(new_k, new_v, layer_idx)
-                    past_key_values = new_cache
-
-                # Re-run the forward pass on the single last accepted token to get correct logits for the next one
-                outputs = self.model(last_accepted_id, past_key_values=past_key_values, use_cache=True)
-                next_token_logits = outputs.logits[:, -1, :]
-                past_key_values = outputs.past_key_values
-
-                # Sample the corrected token from the accurate model's logits
-                probs = torch.nn.functional.softmax(next_token_logits / temperature, dim=-1)
-                corrected_id = torch.multinomial(probs, num_samples=1)
-                last_token_id = corrected_id
-
-                # Update KV cache with the corrected token
-                outputs = self.model(last_token_id, past_key_values=past_key_values, use_cache=True)
-                past_key_values = outputs.past_key_values
-
-                correction_token = self.tokenizer.decode(corrected_id.item())
-
-                if not correction_token or self.tokenizer.eos_token in correction_token:
-                    if verbose: print("⏹️ Correction step produced EOS or was empty. Stopping.")
+                else:
+                    corrected_token = torch.argmax(target_logit, dim=-1).item()
+                    corrected_str = self.tokenizer.decode(corrected_token).replace('\n', '\\n')
+                    if verbose:
+                        status = "\033[91m❌ Rejected\033[0m"
+                        print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>11.2%} │ {status:<28s} │ {corrected_str:<15.15s} │")
+                        print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
+                    generated_token_ids.append(corrected_token)
+                    total_accepted_draft_tokens += accepted_count
                     break
+            else:
+                total_accepted_draft_tokens += accepted_count
+                generated_token_ids.extend(draft_ids.tolist())
 
-                if verbose: print(f"👍 \033[92mCorrected token:\033[0m '{correction_token.strip()}'")
+                last_logit = logits[:, -1, :]
+                next_token = torch.argmax(last_logit, dim=-1).item()
+                generated_token_ids.append(next_token)
 
-                current_text_for_draft += correction_token
-                full_generated_text += correction_token
-                n_generated += 1
-            else: # All draft tokens were accepted
-                last_token_id = torch.tensor([[accepted_ids[-1]]], dtype=torch.long, device=self.model.device)
+                if verbose:
+                    print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
+                    accepted_token_strs = [self.tokenizer.decode(t).replace('\n', '\\n') for t in draft_ids.tolist()]
+                    next_token_str = self.tokenizer.decode(next_token).replace('\n', '\\n')
+                    print(f"✅ \033[92mAccepted all {accepted_count} tokens: \033[0m{accepted_token_strs}")
+                    print(f"✅ \033[92mGenerated Target Token: {next_token_str}\033[0m")
 
-            if self.tokenizer.eos_token in accepted_text:
-                if verbose: print("⏹️ EOS token found in accepted text. Stopping.")
+            if self.tokenizer.eos_token_id in generated_token_ids:
+                eos_index = generated_token_ids.index(self.tokenizer.eos_token_id)
+                generated_token_ids = generated_token_ids[:eos_index]
+                if verbose: print("🛑 EOS token generated. Stopping.")
                 break
 
             step += 1
 
-        total_time_end = time.time()
-        total_time = total_time_end - total_time_start
+        end_time = time.time()
+        final_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=False)
 
         if verbose:
-            acceptance_rate = (total_accepted_tokens / total_drafted_tokens * 100) if total_drafted_tokens > 0 else 0
+            total_time = end_time - start_time
+            num_generated = len(generated_token_ids)
+            acceptance_rate = (total_accepted_draft_tokens / total_draft_tokens) * 100 if total_draft_tokens > 0 else 0
+            latency = (total_time / num_generated) * 1000 if num_generated > 0 else float('inf')
+            throughput = num_generated / total_time if total_time > 0 else float('inf')
+
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
-            print(f"├─ Total Generated: {n_generated} tokens")
-            print(f"├─ Acceptance Rate: {acceptance_rate:.2f}% ({total_accepted_tokens}/{total_drafted_tokens})")
-            if total_time > 0:
-                print(f"└─ Total Time: {total_time:.2f}s ({n_generated / total_time:.2f} tokens/s)")
-            else:
-                print(f"└─ Total Time: {total_time:.2f}s")
-            print("\033[95m" + "─" * 50 + "\033[0m")
+            print(f"\033[94m💬 User Input:\033[0m\n{text}")
+            print(f"\n\033[92m🟢 Generated Text:\033[0m\n{final_text}")
+            print("\n\033[94m📊 Performance:\033[0m")
+            print(f"├─ Total Time: {total_time:.2f}s")
+            print(f"├─ Latency: {latency:.2f} ms/token")
+            print(f"└─  Throughput: {throughput:.2f} tokens/s")
+            print(f"\033[94m✨ Speculative Stats:\033[0m")
+            print(f"├─ Acceptance Rate: {acceptance_rate:.2f}%")
+            print(f"├─ Total Drafted Tokens: {total_draft_tokens}")
+            print(f"└─ Total Accepted Draft Tokens: {total_accepted_draft_tokens}")
 
-            # Final generated text
-            print(f"\n\033[94m💬 User Input:\033[0m\n{text}")
-            print(f"\n\033[92m🟢 Full Generated Text:\033[0m\n{full_generated_text}")
-
-        return full_generated_text
+        return final_text
 
 def set_seed(seed: int):
     """
