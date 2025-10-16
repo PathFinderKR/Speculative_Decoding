@@ -7,12 +7,13 @@ import random
 import numpy as np
 from typing import List, Dict, Optional
 import torch
-from transformers import TextStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 
 class BitNet:
     def __init__(
         self,
-        model_path: str,
+        model_id: str,
+        quantized_path: str,
         host: str = "127.0.0.1",
         port: int = 8080,
         ctx_size: int = 1024,
@@ -22,7 +23,14 @@ class BitNet:
         slot_id: int = 1,
     ):
         self.main_path = os.path.join("build", "bin", "llama-server")
-        self.model_path = model_path
+        self.tokenizer = None
+        self.streamer = None
+        self.tokenizer_id = model_id
+        self.pad_token = "<|pad|>"
+        self.model = None
+        self.model_id = model_id
+        self.dtype = torch.float32
+        self.model_path = quantized_path
         self.host = host
         self.port = int(port)
         self.ctx_size = int(ctx_size)
@@ -75,9 +83,37 @@ class BitNet:
             self.process.wait()
             print("🛑 Server stopped.")
 
+    def init_tokenizer(
+            self,
+            verbose: bool = False
+    ):
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer_id,
+            use_fast=True,
+        )
+        self.tokenizer.pad_token = self.pad_token
+        self.streamer = TextStreamer(self.tokenizer)
+
+        if verbose:
+            print(self.tokenizer)
+
+    def init_model(
+            self,
+            verbose: bool = False
+    ):
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            device_map="cpu",
+            dtype=self.dtype
+        )
+        self.model.eval()
+
+        if verbose:
+            print(self.model)
+            print(f"Number of parameters: {self.model.num_parameters() / 1e9:.2f}B")
+
     def format_falcon_prompt(
             self,
-            tokenizer,
             system_prompt: str,
             user_prompt: str,
             assistant_response: str = ""
@@ -86,7 +122,7 @@ class BitNet:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        input_ids = tokenizer.apply_chat_template(
+        input_ids = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             tokenize=False,
@@ -101,7 +137,98 @@ class BitNet:
         self.messages.append({"role": "assistant", "content": content})
 
     @torch.no_grad()
-    def generate(
+    def generate_hf(
+            self,
+            text: str,
+            max_new_tokens: int = 128,
+            temperature: float = 1.0,
+            top_p: float = 1.0,
+            top_k: int = 0,
+            speculative: bool = False,
+            num_assistant_tokens: int = None,
+            assistant_confidence_threshold: float = None,
+            stream: bool = False,
+            verbose: bool = False,
+    ) -> str:
+        quantized_model = None
+        if speculative:
+            quantized_model = AutoModelForCausalLM.from_pretrained(
+                self.model_id,
+                gguf_file=self.model_path,
+                device_map="cpu",
+                dtype=self.dtype
+            )
+            quantized_model.eval()
+
+        start_time = time.time()
+
+        inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=False).to(self.model.device)
+        input_len = inputs["input_ids"].shape[-1]
+
+        outputs = self.model.generate(
+            **inputs,
+            pad_token_id=self.tokenizer.pad_token_id,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            use_cache=True,
+            # cache_implementation="quantized",
+            assistant_model=quantized_model if speculative else None,
+            num_assistant_tokens=num_assistant_tokens,
+            assistant_confidence_threshold=assistant_confidence_threshold,
+            streamer=self.streamer if not stream else None,
+            return_dict_in_generate=True,
+            output_scores=verbose,
+        )
+        generated = outputs.sequences[0][input_len:]
+        generated_text = self.tokenizer.decode(generated.tolist(), skip_special_tokens=False)
+
+        end_time = time.time()
+
+        if verbose:
+            total_time = end_time - start_time
+            num_input_tokens = input_len
+            num_generated_tokens = len(generated)
+
+            decode_time = total_time
+            decode_tokens_per_second = num_generated_tokens / decode_time if decode_time > 0 else float('inf')
+            decode_ms_per_token = (decode_time * 1000) / num_generated_tokens if num_generated_tokens > 0 else 0
+
+            print("\n\033[95m" + "─" * 50)
+            print("🧠 Generation Info (Hugging Face)")
+            print("─" * 50 + "\033[0m")
+            print(f"\033[94m💬 User Input:\033[0m\n{text}")
+            print(f"\n\033[92m🟢 Generated Text:\033[0m\n{generated_text}")
+            print("\n\033[94m📊 Timings:\033[0m")
+            print(f"  - Total Time: {total_time:.2f}s")
+            print(f"  - Decode: {decode_ms_per_token:.2f} ms/token, {decode_tokens_per_second:.2f} tokens/s")
+            print(f"\033[94m📦 Tokens:\033[0m")
+            print(f"  - Prefilled: {num_input_tokens}")
+            print(f"  - Decoded: {num_generated_tokens}")
+            if speculative:
+                print(f"\033[94m✨ Speculative Decoding:\033[0m")
+                print(f"  - Assistant Tokens: {num_assistant_tokens}")
+                print(f"  - Acceptance Rate: {outputs.acceptance_rate * 100:.2f}%")
+
+            print("\n\033[95m" + "─" * 50)
+            print("💡 Token Probabilities")
+            print("─" * 50 + "\033[0m")
+            print(f"| {'Step':>4s} | {'Token':<15s} | {'Probability':>12s} |")
+            print(f"|{'-'*6}|{'-'*17}|{'-'*14}|")
+
+            probs = torch.stack([torch.softmax(s, dim=-1) for s in outputs.scores], dim=1).squeeze()
+
+            for i, token_id in enumerate(generated):
+                token_prob = probs[i, token_id].item()
+                token_str = self.tokenizer.decode(token_id).replace('\n', '\\n')
+                print(f"| {i+1:>4d} | {token_str:<15.15s} | {token_prob:>12.2%} |")
+
+        return generated_text
+
+    @torch.no_grad()
+    def generate_gguf(
             self,
             text: str,
             max_new_tokens: int = 128,
@@ -166,110 +293,189 @@ class BitNet:
             print(f"Error during API request: {e}")
             return ""
 
-    def verify(
+    @torch.no_grad()
+    def verify_hf(
             self,
             text: str,
-            num_verify: int,
-            threshold: float,
+            num_verify: int = 4,
+            confidence_threshold: float = 0.4,
             verbose: bool = False
-    ) -> Dict:
-        """
-        Verifies the last `num_verify` tokens of the given text using the /infill endpoint.
+    ):
+        # 1. Tokenize
+        inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        input_ids = inputs.input_ids.to(self.model.device)
+        total_len = input_ids.shape[1]
 
-        Returns a dictionary with the index of the first rejected token (`cut_index`)
-        and the list of probabilities for the verified tokens.
-        """
-        # 1. Tokenize the text to find the split point
-        try:
-            tokenize_response = requests.post(f"{self.server_url}/tokenize", json={"content": text})
-            tokenize_response.raise_for_status()
-            tokens = tokenize_response.json().get("tokens", [])
-        except requests.exceptions.RequestException as e:
-            print(f"Error during tokenization API request: {e}")
-            return {"cut_index": 0, "probs": []}
+        # 2. Forward pass
+        outputs = self.model(input_ids)
+        logits = outputs.logits
 
-        if not tokens:
-            return {"cut_index": 0, "probs": []}
-
-        if len(tokens) < num_verify:
-            num_verify = len(tokens)
-
-        if num_verify <= 0:
-            return {"cut_index": 0, "probs": []}
-
-        split_point = len(tokens) - num_verify
-
-        # Reconstruct prefix and suffix from tokens to avoid character boundary issues
-        try:
-            prefix = requests.post(f"{self.server_url}/detokenize", json={"tokens": tokens[:split_point]}).json()[
-                "content"]
-            suffix = requests.post(f"{self.server_url}/detokenize", json={"tokens": tokens[split_point:]}).json()[
-                "content"]
-        except (requests.exceptions.RequestException, KeyError) as e:
-            print(f"Error during detokenization: {e}")
-            return {"cut_index": 0, "probs": []}
-
-        # 2. Call /infill to get probabilities for the suffix
-        headers = {"Content-Type": "application/json"}
-        data = {
-            "input_prefix": prefix,
-            "input_suffix": suffix,
-            "n_predict": 0,  # We only want to evaluate, not generate
-            "slot_id": self.slot_id,
-            "n_probs": 1,
-        }
-
-        try:
-            response = requests.post(
-                f"{self.server_url}/infill",
-                headers=headers,
-                data=json.dumps(data),
-            )
-            response.raise_for_status()
-            response_data = response.json()
-
-        except requests.exceptions.RequestException as e:
-            print(f"Error during verification API request: {e}")
-            return {"cut_index": 0, "probs": []}
-
-        # 3. Process probabilities and find the cut_index
-        probs: List[float] = []
-        cut_index = num_verify
-
-        completion_probs = response_data.get("completion_probabilities", [])
-
-        for i, prob_info in enumerate(completion_probs):
-            if i >= num_verify:
-                break
-            # The most probable token is the first in the list
-            prob = prob_info['probs'][0]['prob']
-            probs.append(prob)
-
-            if prob < threshold and cut_index == num_verify:
-                cut_index = i
+        # 3. Probabilities
+        verify_logits = logits[0, -num_verify - 1:-1, :]
+        probs = torch.softmax(verify_logits, dim=-1)
+        verify_token_ids = input_ids[0, -num_verify:]
 
         if verbose:
             print("\n\033[95m" + "─" * 50)
-            print("🤖 Verification Report")
+            print("🔍 Verification Info (Hugging Face)")
             print("─" * 50 + "\033[0m")
-            print(f"\033[94mVerified Text:\033[0m\n{suffix}")
-            print(f"\033[93mConfidence Threshold:\033[0m {threshold:.2f}\n")
-            print("\033[96m🧩 Token Probabilities:\033[0m")
-            for i, prob in enumerate(probs):
-                tok_str = completion_probs[i]['content'].replace('\n', '\\n')
-                status = (
-                    "\033[92mACCEPTED\033[0m ✅" if prob >= threshold
-                    else "\033[91mREJECTED\033[0m ❌"
+            print(f"\033[94m📝 Full Text:\033[0m\n'{text}'")
+            print(f"\033[94m🎯 Confidence Threshold:\033[0m {confidence_threshold:.2%}")
+            print("\n" + "─" * 50)
+            header = f"| {'Step':>4s} | {'Token':<15s} | {'Probability':>12s} | {'Status':<10s} |"
+            print(header)
+            print(f"|{'-'*6}|{'-'*17}|{'-'*14}|{'-'*12}|")
+
+        accepted = True
+        results = []
+        for i in range(num_verify):
+            token_id = verify_token_ids[i]
+            token_prob = probs[i, token_id].item()
+
+            if accepted and token_prob >= confidence_threshold:
+                status = "Accepted"
+                status_color = "\033[92m"
+            else:
+                accepted = False
+                status = "Rejected"
+                status_color = "\033[91m"
+
+            token_str = self.tokenizer.decode(token_id).replace('\n', '\\n')
+            results.append({"token": token_str, "prob": token_prob, "status": status})
+
+            if verbose:
+                print(f"| {total_len - num_verify + i + 1:>4d} | {token_str:<15.15s} | {token_prob:>12.2%} | {status_color}{status:<10s}\033[0m |")
+
+        if verbose:
+            print("\033[95m" + "─" * 50 + "\033[0m")
+
+        return results
+
+    def speculative_decoding(
+            self,
+            text: str,
+            max_new_tokens: int = 128,
+            temperature: float = 1.0,
+            top_p: float = 1.0,
+            top_k: int = 0,
+            num_verify: int = 4,
+            confidence_threshold: float = 0.4,
+            verbose: bool = False,
+    ):
+        full_generated_text = ""
+        current_text = text
+        n_generated = 0
+        total_time_start = time.time()
+
+        if verbose:
+            print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
+            print("✨ Starting Speculative Decoding")
+            print(f"├─ Target Model: {self.model_id}")
+            print(f"├─ Draft Model: {self.model_path}")
+            print(f"└─ Draft Length: {num_verify}, Confidence: {confidence_threshold:.1f}")
+            print("\033[95m" + "─" * 50 + "\033[0m")
+
+        while n_generated < max_new_tokens:
+            # 1. Draft Generation (Fast Model)
+            remaining_tokens = max_new_tokens - n_generated
+            draft_len = min(num_verify, remaining_tokens)
+
+            if verbose:
+                print(f"\n\033[96m--- Step {n_generated // num_verify + 1} ---\033[0m")
+                print(f"📝 \033[94mPrompting draft model with:\033[0m '...{current_text[-50:]}'")
+
+            draft_text = self.generate_gguf(
+                text=current_text,
+                max_new_tokens=draft_len,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                verbose=False,
+            )
+
+            if not draft_text:
+                if verbose: print("⚠️ Draft model produced no output. Stopping.")
+                break
+
+            draft_tokens = self.tokenizer(draft_text, return_tensors="pt", add_special_tokens=False)
+            num_draft_tokens = draft_tokens.input_ids.shape[1]
+            print(num_draft_tokens)
+            
+            if verbose:
+                print(f"🚀 \033[93mDraft generated:\033[0m '{draft_text.strip()}' ({num_draft_tokens} tokens)")
+
+            # 2. Verification (Accurate Model)
+            verification_text = current_text + draft_text
+            verification_results = self.verify_hf(
+                text=verification_text,
+                num_verify=num_draft_tokens,
+                confidence_threshold=confidence_threshold,
+                verbose=verbose,
+            )
+
+            # 3. Accept/Reject Logic
+            accepted_text = ""
+            n_accepted = 0
+            for i, result in enumerate(verification_results):
+                if result["status"] == "Accepted":
+                    accepted_text += self.tokenizer.decode(draft_tokens[i])
+                    n_accepted += 1
+                else:
+                    # First rejection, stop here
+                    break
+            
+            if verbose:
+                print(f"✅ \033[92mAccepted {n_accepted} tokens:\033[0m '{accepted_text.strip()}'")
+
+            # Append accepted tokens to the context for the next step
+            current_text += accepted_text
+            full_generated_text += accepted_text
+            n_generated += n_accepted
+
+            # If not all draft tokens were accepted, perform a correction step
+            if n_accepted < num_draft_tokens:
+                if n_generated >= max_new_tokens:
+                    break # Reached max tokens
+
+                if verbose:
+                    print("🤔 \033[91mPerforming correction step...\033[0m")
+
+                # Generate a single token with the accurate model
+                correction_token = self.generate_hf(
+                    text=current_text,
+                    max_new_tokens=1,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    verbose=False,
                 )
-                print(f"  • Token[{i:02d}]: '{tok_str or '[SPACE]'}' → P={prob:.3f} → {status}")
 
-            print(f"\n\033[93m✂️  Cut Index:\033[0m {cut_index}")
-            print("\033[95m" + "─" * 50 + "\033[0m\n")
+                if not correction_token or self.tokenizer.eos_token in correction_token:
+                    if verbose: print("⏹️ Correction step produced EOS or was empty. Stopping.")
+                    break
 
-        return {"cut_index": cut_index, "probs": probs}
+                if verbose:
+                    print(f"👍 \033[92mCorrected token:\033[0m '{correction_token.strip()}'")
 
+                current_text += correction_token
+                full_generated_text += correction_token
+                n_generated += 1
+            
+            if any(self.tokenizer.decode(t) == self.tokenizer.eos_token for t in self.tokenizer.encode(accepted_text)):
+                if verbose: print("⏹️ EOS token found in accepted text. Stopping.")
+                break
 
+        total_time_end = time.time()
+        total_time = total_time_end - total_time_start
+        
+        if verbose:
+            print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
+            print("🏁 Speculative Decoding Finished")
+            print(f"├─ Total Generated: {n_generated} tokens")
+            print(f"└─ Total Time: {total_time:.2f}s ({n_generated / total_time:.2f} tokens/s)")
+            print("\033[95m" + "─" * 50 + "\033[0m")
 
+        return full_generated_text
 
 
 def set_seed(seed: int):
@@ -287,75 +493,3 @@ def set_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     print(f"Random seed set to {seed}")
-
-@torch.no_grad()
-def generate_response(
-    tokenizer,
-    model,
-    assistant_model=None,
-    system_prompt: str = "You are an helpful assistant.",
-    user_prompt: str = "",
-    max_new_tokens: int = 128,
-    num_assistant_tokens: int = None,
-    assistant_confidence_threshold: float = None,
-    verbose: bool = True,
-):
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt"
-    ).to(model.device)
-
-    outputs = model.generate(
-        inputs,
-        max_new_tokens=max_new_tokens,
-        pad_token_id=tokenizer.pad_token_id,
-        do_sample=False,
-        use_cache=False,
-        #cache_implementation="quantized",
-        assistant_model=assistant_model,
-        num_assistant_tokens=num_assistant_tokens,
-        assistant_confidence_threshold=assistant_confidence_threshold,
-        streamer=TextStreamer(tokenizer),
-        return_dict_in_generate=verbose,
-        output_scores=verbose,
-    )
-
-    if verbose:
-        transition_scores = model.compute_transition_scores(
-            outputs.sequences, outputs.scores, normalize_logits=True
-        )
-
-        generated_tokens = outputs.sequences[:, 1:]
-
-        print("\n\033[95m─────────────────────────────")
-        print("🧠 Token Generation Log")
-        print("─────────────────────────────\033[0m")
-        print(f"System Prompt: \033[94m{system_prompt}\033[0m")
-        print(f"User Prompt:   \033[94m{user_prompt}\033[0m\n")
-
-        print(f"\033[96m| {'#':>3s} | {'Token ID':>8s} | {'Token':<12s} | {'LogProb':>9s} | {'Prob':>9s} |\033[0m")
-        print(f"\033[90m|{'-' * 5}|{'-' * 10}|{'-' * 14}|{'-' * 11}|{'-' * 11}|\033[0m")
-
-        for i, (tok, score) in enumerate(zip(generated_tokens[0], transition_scores[0])):
-            prob = float(np.exp(score.numpy()))
-            color = "\033[92m" if prob > 0.5 else ("\033[93m" if prob > 0.1 else "\033[91m")
-            tok_text = tokenizer.decode(tok).replace("\n", "\\n").replace("\t", "\\t") or "[SPACE]"
-            print(f"{color}| {i:3d} | {int(tok):8d} | {tok_text:<12.12s} | {score.numpy():9.3f} | {prob:9.2%} |\033[0m")
-
-        print("\033[90m─────────────────────────────\033[0m\n")
-
-        decoded_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-        print(f"\033[92m🟢 Final Generated Text:\033[0m\n{decoded_text}\n")
-        print("\033[95m─────────────────────────────\033[0m\n")
-
-        return None
-
-    else:
-        decoded_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return decoded_text

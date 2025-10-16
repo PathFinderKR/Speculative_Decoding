@@ -3,7 +3,6 @@ import re
 import subprocess
 from typing import List, Optional
 import torch
-from utils import format_falcon_prompt
 
 
 def generate_draft_response(
