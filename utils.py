@@ -314,10 +314,13 @@ class BitNet:
 
         # Generation loop
         while len(generated_token_ids) < max_new_tokens:
-            current_input_ids = torch.cat([
-                prompt_tokens,
-                torch.tensor([generated_token_ids], dtype=torch.long, device=self.model.device)
-            ], dim=-1)
+            current_input_ids = torch.cat(
+                [
+                    prompt_tokens,
+                    torch.tensor([generated_token_ids], dtype=torch.long, device=self.model.device)
+                ],
+                dim=-1,
+            )
             current_text = self.tokenizer.decode(current_input_ids[0])
 
             # 1. Draft Generation
@@ -379,19 +382,23 @@ class BitNet:
                     if verbose:
                         status = "\033[92m✅ Accepted\033[0m"
                         corrected_str = "-"
-                        print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>11.2%} │ {status:<28s} │ {corrected_str:<15s} │")
+                        print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15s} │")
 
                 else:
                     corrected_token = torch.argmax(target_logit, dim=-1).item()
-                    corrected_str = self.tokenizer.decode(corrected_token).replace('\n', '\\n')
                     if verbose:
+                        corrected_str = self.tokenizer.decode(corrected_token).replace('\n', '\\n')
                         status = "\033[91m❌ Rejected\033[0m"
-                        print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>11.2%} │ {status:<28s} │ {corrected_str:<15.15s} │")
+                        print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15.15s} │")
                         print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
+                    if accepted_count > 0:
+                        generated_token_ids.extend(draft_ids[:accepted_count].tolist())
                     generated_token_ids.append(corrected_token)
+
                     total_accepted_draft_tokens += accepted_count
                     break
             else:
+                # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
                 generated_token_ids.extend(draft_ids.tolist())
 
@@ -404,7 +411,7 @@ class BitNet:
                     accepted_token_strs = [self.tokenizer.decode(t).replace('\n', '\\n') for t in draft_ids.tolist()]
                     next_token_str = self.tokenizer.decode(next_token).replace('\n', '\\n')
                     print(f"✅ \033[92mAccepted all {accepted_count} tokens: \033[0m{accepted_token_strs}")
-                    print(f"✅ \033[92mGenerated Target Token: {next_token_str}\033[0m")
+                    print(f"✅ \033[92mGenerated Target Token: \033[0m{next_token_str}")
 
             if self.tokenizer.eos_token_id in generated_token_ids:
                 eos_index = generated_token_ids.index(self.tokenizer.eos_token_id)
