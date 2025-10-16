@@ -8,6 +8,7 @@ import numpy as np
 from typing import List, Dict, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+from transformers.cache_utils import DynamicCache
 
 class BitNet:
     def __init__(
@@ -141,8 +142,6 @@ class BitNet:
             self,
             text: str,
             max_new_tokens: int = 128,
-            temperature: float = 1.0,
-            top_p: float = 1.0,
             speculative: bool = False,
             num_assistant_tokens: int = None,
             assistant_confidence_threshold: float = None,
@@ -169,14 +168,12 @@ class BitNet:
             pad_token_id=self.tokenizer.pad_token_id,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            temperature=temperature,
-            top_p=top_p,
             use_cache=False,
             # cache_implementation="quantized",
             assistant_model=quantized_model if speculative else None,
             num_assistant_tokens=num_assistant_tokens,
             assistant_confidence_threshold=assistant_confidence_threshold,
-            streamer=self.streamer if not stream else None,
+            streamer=self.streamer if stream else None,
             return_dict_in_generate=True,
             output_scores=verbose,
         )
@@ -236,7 +233,7 @@ class BitNet:
             top_k: int = 0,
             seed: int = 42,
             verbose: bool = False,
-    ) -> str:
+    ):
         headers = {"Content-Type": "application/json"}
         data = {
             "prompt": text,
@@ -289,41 +286,39 @@ class BitNet:
 
         except requests.exceptions.RequestException as e:
             print(f"Error during API request: {e}")
-            return ""
 
     @torch.no_grad()
     def verify_hf(
             self,
-            text: str,
-            num_verify: int = 4,
+            input_ids: torch.Tensor,
+            num_verify: int,
             confidence_threshold: float = 0.4,
+            past_key_values: Optional[tuple] = None,
             verbose: bool = False
     ):
-        # 1. Tokenize
-        inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
-        input_ids = inputs.input_ids.to(self.model.device)
-        total_len = input_ids.shape[1]
-
-        # 2. Forward pass
-        outputs = self.model(input_ids)
+        # 1. Forward pass with KV cache
+        outputs = self.model(input_ids, past_key_values=past_key_values, use_cache=True)
         logits = outputs.logits
+        new_past_key_values = outputs.past_key_values
 
-        # 3. Probabilities
-        verify_logits = logits[0, -num_verify - 1:-1, :]
+        # 2. Probabilities for verification
+        # Logits for the tokens we are verifying (all but the very first input token)
+        verify_logits = logits[0, :-1, :]
         probs = torch.softmax(verify_logits, dim=-1)
-        verify_token_ids = input_ids[0, -num_verify:]
+        # The actual token IDs that were generated and need verification
+        verify_token_ids = input_ids[0, 1:]
 
         if verbose:
-            print("\n\033[95m" + "─" * 50)
-            print("🔍 Verification Info")
-            print("─" * 50 + "\033[0m")
-            print(f"\033[94m📝 Full Text:\033[0m\n{text}")
-            print(f"\033[94m🔢 Verifying Last {num_verify} Tokens:\033[0m {self.tokenizer.decode(verify_token_ids)}")
-            print(f"\033[94m🎯 Confidence Threshold:\033[0m {confidence_threshold:.2%}")
-            print("\n" + "─" * 50)
+            full_sequence_ids = (
+                torch.cat([past_kv[0][0, 0, :, 0] for past_kv in past_key_values], dim=0).long()
+                if past_key_values is not None
+                else torch.tensor([])
+            )
+            total_len = len(full_sequence_ids) + len(verify_token_ids)
+            print("\n" + "─" * 60)
             header = f"| {'Step':>4s} | {'Token':<15s} | {'Probability':>12s} | {'Status':<10s} |"
             print(header)
-            print(f"|{'-'*6}|{'-'*17}|{'-'*14}|{'-'*12}|")
+            print(f"|{'-' * 6}|{'-' * 17}|{'-' * 14}|{'-' * 12}|")
 
         accepted = True
         results = []
@@ -343,13 +338,15 @@ class BitNet:
             results.append({"token": token_str, "prob": token_prob, "status": status})
 
             if verbose:
-                print(f"| {total_len - num_verify + i + 1:>4d} | {token_str:<15.15s} | {token_prob:>12.2%} | {status_color}{status:<10s}\033[0m |")
+                print(
+                    f"| {total_len - num_verify + i + 1:>4d} | {token_str:<15.15s} | {token_prob:>12.2%} | {status_color}{status:<10s}\033[0m |")
 
         if verbose:
-            print("\033[95m" + "─" * 50 + "\033[0m")
+            print("─" * 60)
 
-        return results
+        return results, new_past_key_values
 
+    @torch.no_grad()
     def speculative_decoding(
             self,
             text: str,
@@ -362,18 +359,26 @@ class BitNet:
             verbose: bool = False,
     ):
         full_generated_text = ""
-        current_text = text
+        current_text_for_draft = text
         n_generated = 0
         step = 1
+        total_accepted_tokens = 0
+        total_drafted_tokens = 0
         total_time_start = time.time()
 
         if verbose:
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
-            print("✨ Starting Speculative Decoding")
+            print("✨ Starting Speculative Decoding (KV Cache Optimized)")
             print(f"├─ Target Model: {self.model_id}")
             print(f"├─ Draft Model: {self.model_path}")
             print(f"└─ Draft Length: {num_assistant_tokens}, Confidence: {confidence_threshold:.1f}")
             print("\033[95m" + "─" * 50 + "\033[0m")
+
+        # Initial prefill for the verification model's KV cache
+        initial_input_ids = self.tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids.to(self.model.device)
+        outputs = self.model(initial_input_ids, use_cache=True)
+        past_key_values = outputs.past_key_values
+        last_token_id = initial_input_ids[:, -1:]
 
         while n_generated < max_new_tokens:
             # 1. Draft Generation (Fast Model)
@@ -381,38 +386,36 @@ class BitNet:
             draft_len = min(num_assistant_tokens, remaining_tokens)
 
             if verbose:
-                print(f"\n\033[96m--- Step {step} ---\033[0m")
-                print(f"📝 \033[94mPrompting draft model with:\033[0m\n...{current_text[-50:]}")
+                print(f"\n\033[95m--------------- Step {step} ---------------\033[0m")
+                print(f"📝 \033[94mDraft Input:\033[0m {current_text_for_draft.strip()}")
 
             draft_text = self.generate_gguf(
-                text=current_text,
+                text=current_text_for_draft,
                 max_new_tokens=draft_len,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
+                temperature=temperature, top_p=top_p, top_k=top_k,
                 verbose=False,
             )
 
-            if not draft_text:
-                if verbose: print("⚠️ Draft model produced no output. Stopping.")
-                break
-
             draft_token_ids = self.tokenizer.encode(draft_text, add_special_tokens=False)
             num_draft_tokens = len(draft_token_ids)
+            total_drafted_tokens += num_draft_tokens
 
             if num_draft_tokens == 0:
                 if verbose: print("⚠️ Draft model produced no new tokens. Stopping.")
                 break
 
             if verbose:
-                print(f"🚀 \033[93mDraft generated:\033[0m\n{draft_text.strip()} ({num_draft_tokens} tokens)")
+                print(f"🚀 \033[93mDraft Generated:\033[0m {draft_text.strip()} ({num_draft_tokens} tokens)")
 
             # 2. Verification (Accurate Model)
-            verification_text = current_text + draft_text
-            verification_results = self.verify_hf(
-                text=verification_text,
+            draft_ids_tensor = torch.tensor(draft_token_ids, dtype=torch.long, device=self.model.device).unsqueeze(0)
+            verification_input_ids = torch.cat([last_token_id, draft_ids_tensor], dim=1)
+
+            verification_results, past_key_values = self.verify_hf(
+                input_ids=verification_input_ids,
                 num_verify=num_draft_tokens,
                 confidence_threshold=confidence_threshold,
+                past_key_values=past_key_values,
                 verbose=verbose,
             )
 
@@ -422,46 +425,71 @@ class BitNet:
                 if result["status"] == "Accepted":
                     n_accepted += 1
                 else:
-                    break  # First rejection, stop here
+                    break
 
+            total_accepted_tokens += n_accepted
             accepted_ids = draft_token_ids[:n_accepted]
             accepted_text = self.tokenizer.decode(accepted_ids)
 
             if verbose:
-                print(f"✅ \033[92mAccepted {n_accepted} tokens:\033[0m '{accepted_text.strip()}'")
+                print(f"✅ \033[92mAccepted {n_accepted} tokens:\033[0m {accepted_text.strip()}")
 
-            # Append accepted tokens to the context for the next step
-            current_text += accepted_text
+            current_text_for_draft += accepted_text
             full_generated_text += accepted_text
             n_generated += n_accepted
 
-            if n_generated >= max_new_tokens:
-                break
+            if n_generated >= max_new_tokens: break
 
             # If not all draft tokens were accepted, perform a correction step
             if n_accepted < num_draft_tokens:
-                if verbose:
-                    print("🤔 \033[91mPerforming correction step...\033[0m")
+                if verbose: print("🤔 \033[91mPerforming correction step...\033[0m")
 
-                # Generate a single token with the accurate model
-                correction_token = self.generate_hf(
-                    text=current_text,
-                    max_new_tokens=1,
-                    temperature=temperature,
-                    top_p=top_p,
-                    verbose=False,
-                )
+                # Rewind KV cache to the point of the last accepted token
+                if n_accepted > 0:
+                    last_accepted_id = torch.tensor([[accepted_ids[n_accepted-1]]], dtype=torch.long, device=self.model.device)
+                    num_rejected = num_draft_tokens - n_accepted
+                    new_cache = DynamicCache()
+                    for layer_idx, (k, v) in enumerate(past_key_values):
+                        new_k = k[:, :, :-num_rejected, :]
+                        new_v = v[:, :, :-num_rejected, :]
+                        new_cache.update(new_k, new_v, layer_idx)
+                    past_key_values = new_cache
+                else: # n_accepted == 0
+                    last_accepted_id = last_token_id
+                    new_cache = DynamicCache()
+                    for layer_idx, (k, v) in enumerate(past_key_values):
+                        new_k = k[:, :, :-num_draft_tokens, :]
+                        new_v = v[:, :, :-num_draft_tokens, :]
+                        new_cache.update(new_k, new_v, layer_idx)
+                    past_key_values = new_cache
+
+                # Re-run the forward pass on the single last accepted token to get correct logits for the next one
+                outputs = self.model(last_accepted_id, past_key_values=past_key_values, use_cache=True)
+                next_token_logits = outputs.logits[:, -1, :]
+                past_key_values = outputs.past_key_values
+
+                # Sample the corrected token from the accurate model's logits
+                probs = torch.nn.functional.softmax(next_token_logits / temperature, dim=-1)
+                corrected_id = torch.multinomial(probs, num_samples=1)
+                last_token_id = corrected_id
+
+                # Update KV cache with the corrected token
+                outputs = self.model(last_token_id, past_key_values=past_key_values, use_cache=True)
+                past_key_values = outputs.past_key_values
+
+                correction_token = self.tokenizer.decode(corrected_id.item())
 
                 if not correction_token or self.tokenizer.eos_token in correction_token:
                     if verbose: print("⏹️ Correction step produced EOS or was empty. Stopping.")
                     break
 
-                if verbose:
-                    print(f"👍 \033[92mCorrected token:\033[0m '{correction_token.strip()}'")
+                if verbose: print(f"👍 \033[92mCorrected token:\033[0m '{correction_token.strip()}'")
 
-                current_text += correction_token
+                current_text_for_draft += correction_token
                 full_generated_text += correction_token
                 n_generated += 1
+            else: # All draft tokens were accepted
+                last_token_id = torch.tensor([[accepted_ids[-1]]], dtype=torch.long, device=self.model.device)
 
             if self.tokenizer.eos_token in accepted_text:
                 if verbose: print("⏹️ EOS token found in accepted text. Stopping.")
@@ -473,17 +501,22 @@ class BitNet:
         total_time = total_time_end - total_time_start
 
         if verbose:
+            acceptance_rate = (total_accepted_tokens / total_drafted_tokens * 100) if total_drafted_tokens > 0 else 0
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
             print(f"├─ Total Generated: {n_generated} tokens")
+            print(f"├─ Acceptance Rate: {acceptance_rate:.2f}% ({total_accepted_tokens}/{total_drafted_tokens})")
             if total_time > 0:
                 print(f"└─ Total Time: {total_time:.2f}s ({n_generated / total_time:.2f} tokens/s)")
             else:
                 print(f"└─ Total Time: {total_time:.2f}s")
             print("\033[95m" + "─" * 50 + "\033[0m")
 
-        return full_generated_text
+            # Final generated text
+            print(f"\n\033[94m💬 User Input:\033[0m\n{text}")
+            print(f"\n\033[92m🟢 Full Generated Text:\033[0m\n{full_generated_text}")
 
+        return full_generated_text
 
 def set_seed(seed: int):
     """
