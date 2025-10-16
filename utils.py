@@ -143,7 +143,6 @@ class BitNet:
             max_new_tokens: int = 128,
             temperature: float = 1.0,
             top_p: float = 1.0,
-            top_k: int = 0,
             speculative: bool = False,
             num_assistant_tokens: int = None,
             assistant_confidence_threshold: float = None,
@@ -172,8 +171,7 @@ class BitNet:
             do_sample=False,
             temperature=temperature,
             top_p=top_p,
-            top_k=top_k,
-            use_cache=True,
+            use_cache=False,
             # cache_implementation="quantized",
             assistant_model=quantized_model if speculative else None,
             num_assistant_tokens=num_assistant_tokens,
@@ -317,9 +315,10 @@ class BitNet:
 
         if verbose:
             print("\n\033[95m" + "─" * 50)
-            print("🔍 Verification Info (Hugging Face)")
+            print("🔍 Verification Info")
             print("─" * 50 + "\033[0m")
-            print(f"\033[94m📝 Full Text:\033[0m\n'{text}'")
+            print(f"\033[94m📝 Full Text:\033[0m\n{text}")
+            print(f"\033[94m🔢 Verifying Last {num_verify} Tokens:\033[0m {self.tokenizer.decode(verify_token_ids)}")
             print(f"\033[94m🎯 Confidence Threshold:\033[0m {confidence_threshold:.2%}")
             print("\n" + "─" * 50)
             header = f"| {'Step':>4s} | {'Token':<15s} | {'Probability':>12s} | {'Status':<10s} |"
@@ -358,13 +357,14 @@ class BitNet:
             temperature: float = 1.0,
             top_p: float = 1.0,
             top_k: int = 0,
-            num_verify: int = 4,
+            num_assistant_tokens: int = 4,
             confidence_threshold: float = 0.4,
             verbose: bool = False,
     ):
         full_generated_text = ""
         current_text = text
         n_generated = 0
+        step = 1
         total_time_start = time.time()
 
         if verbose:
@@ -372,17 +372,17 @@ class BitNet:
             print("✨ Starting Speculative Decoding")
             print(f"├─ Target Model: {self.model_id}")
             print(f"├─ Draft Model: {self.model_path}")
-            print(f"└─ Draft Length: {num_verify}, Confidence: {confidence_threshold:.1f}")
+            print(f"└─ Draft Length: {num_assistant_tokens}, Confidence: {confidence_threshold:.1f}")
             print("\033[95m" + "─" * 50 + "\033[0m")
 
         while n_generated < max_new_tokens:
             # 1. Draft Generation (Fast Model)
             remaining_tokens = max_new_tokens - n_generated
-            draft_len = min(num_verify, remaining_tokens)
+            draft_len = min(num_assistant_tokens, remaining_tokens)
 
             if verbose:
-                print(f"\n\033[96m--- Step {n_generated // num_verify + 1} ---\033[0m")
-                print(f"📝 \033[94mPrompting draft model with:\033[0m '...{current_text[-50:]}'")
+                print(f"\n\033[96m--- Step {step} ---\033[0m")
+                print(f"📝 \033[94mPrompting draft model with:\033[0m\n...{current_text[-50:]}")
 
             draft_text = self.generate_gguf(
                 text=current_text,
@@ -397,12 +397,15 @@ class BitNet:
                 if verbose: print("⚠️ Draft model produced no output. Stopping.")
                 break
 
-            draft_tokens = self.tokenizer(draft_text, return_tensors="pt", add_special_tokens=False)
-            num_draft_tokens = draft_tokens.input_ids.shape[1]
-            print(num_draft_tokens)
-            
+            draft_token_ids = self.tokenizer.encode(draft_text, add_special_tokens=False)
+            num_draft_tokens = len(draft_token_ids)
+
+            if num_draft_tokens == 0:
+                if verbose: print("⚠️ Draft model produced no new tokens. Stopping.")
+                break
+
             if verbose:
-                print(f"🚀 \033[93mDraft generated:\033[0m '{draft_text.strip()}' ({num_draft_tokens} tokens)")
+                print(f"🚀 \033[93mDraft generated:\033[0m\n{draft_text.strip()} ({num_draft_tokens} tokens)")
 
             # 2. Verification (Accurate Model)
             verification_text = current_text + draft_text
@@ -414,16 +417,16 @@ class BitNet:
             )
 
             # 3. Accept/Reject Logic
-            accepted_text = ""
             n_accepted = 0
-            for i, result in enumerate(verification_results):
+            for result in verification_results:
                 if result["status"] == "Accepted":
-                    accepted_text += self.tokenizer.decode(draft_tokens[i])
                     n_accepted += 1
                 else:
-                    # First rejection, stop here
-                    break
-            
+                    break  # First rejection, stop here
+
+            accepted_ids = draft_token_ids[:n_accepted]
+            accepted_text = self.tokenizer.decode(accepted_ids)
+
             if verbose:
                 print(f"✅ \033[92mAccepted {n_accepted} tokens:\033[0m '{accepted_text.strip()}'")
 
@@ -432,11 +435,11 @@ class BitNet:
             full_generated_text += accepted_text
             n_generated += n_accepted
 
+            if n_generated >= max_new_tokens:
+                break
+
             # If not all draft tokens were accepted, perform a correction step
             if n_accepted < num_draft_tokens:
-                if n_generated >= max_new_tokens:
-                    break # Reached max tokens
-
                 if verbose:
                     print("🤔 \033[91mPerforming correction step...\033[0m")
 
@@ -446,7 +449,6 @@ class BitNet:
                     max_new_tokens=1,
                     temperature=temperature,
                     top_p=top_p,
-                    top_k=top_k,
                     verbose=False,
                 )
 
@@ -460,19 +462,24 @@ class BitNet:
                 current_text += correction_token
                 full_generated_text += correction_token
                 n_generated += 1
-            
-            if any(self.tokenizer.decode(t) == self.tokenizer.eos_token for t in self.tokenizer.encode(accepted_text)):
+
+            if self.tokenizer.eos_token in accepted_text:
                 if verbose: print("⏹️ EOS token found in accepted text. Stopping.")
                 break
 
+            step += 1
+
         total_time_end = time.time()
         total_time = total_time_end - total_time_start
-        
+
         if verbose:
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
             print(f"├─ Total Generated: {n_generated} tokens")
-            print(f"└─ Total Time: {total_time:.2f}s ({n_generated / total_time:.2f} tokens/s)")
+            if total_time > 0:
+                print(f"└─ Total Time: {total_time:.2f}s ({n_generated / total_time:.2f} tokens/s)")
+            else:
+                print(f"└─ Total Time: {total_time:.2f}s")
             print("\033[95m" + "─" * 50 + "\033[0m")
 
         return full_generated_text
