@@ -8,59 +8,50 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 
 class BitNet:
-    def __init__(
-        self,
-        model_id: str,
-        quantized_path: str,
-        host: str = "127.0.0.1",
-        port: int = 8080,
-        ctx_size: int = 1024,
-        n_threads: int = 12,
-        n_gpu_layers: int = 0,
-        batch_size: int = 1,
-        slot_id: int = 1,
-    ):
+    def __init__(self):
         self.main_path = os.path.join("build", "bin", "llama-server")
+        self.server_url = None
+        self.slot_id: int = 1
         self.tokenizer = None
         self.streamer = None
-        self.tokenizer_id = model_id
-        self.pad_token = "<|pad|>"
         self.model = None
-        self.model_id = model_id
-        self.dtype = torch.bfloat16
-        self.model_path = quantized_path
-        self.host = host
-        self.port = int(port)
-        self.ctx_size = int(ctx_size)
-        self.n_threads = int(n_threads)
-        self.n_gpu_layers = int(n_gpu_layers)
-        self.batch_size = int(batch_size)
-        self.slot_id = int(slot_id)
-        self.server_url =  f"http://{self.host}:{self.port}"
+        self.pad_token = "<|pad|>"
+        self.dtype = torch.float32
         self.messages: List[Dict[str, str]] = []
         self.process: Optional[subprocess.Popen] = None
 
     def __del__(self):
         self.stop_server()
 
-    def start_server(self, extra_args: Optional[List[str]] = None, verbose: bool = False):
+    def start_server(
+            self,
+            bitnet_path: str,
+            ctx_size: int = 1024,
+            n_threads: int = 12,
+            batch_size: int = 1,
+            host: str = "127.0.0.1",
+            port: int = 8080,
+            extra_args: Optional[List[str]] = None,
+            verbose: bool = False
+    ):
         cmd = [
             self.main_path,
-            "-m", self.model_path,
-            "-c", str(self.ctx_size),
-            "-t", str(self.n_threads),
-            "-ngl", str(self.n_gpu_layers),
-            "-b", str(self.batch_size),
-            "--host", self.host,
-            "--port", str(self.port),
+            "-m", bitnet_path,
+            "-c", str(ctx_size),
+            "-t", str(n_threads),
+            "-ngl", "0",
+            "-b", str(batch_size),
+            "--host", host,
+            "--port", str(port),
             "-nkvo", # disable KV offload
         ]
         if verbose:
             cmd.append("-v")
         if extra_args:
             cmd += list(extra_args)
+        self.server_url = f"http://{host}:{port}"
 
-        print(f"🚀 Starting llama-server on {self.host}:{self.port}")
+        print(f"🚀 Starting llama-server on {host}:{port}")
         self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         for _ in range(10):
@@ -83,11 +74,12 @@ class BitNet:
 
     def init_tokenizer(
             self,
+            tokenizer_id: str,
             verbose: bool = False
     ):
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.tokenizer_id,
-            use_fast=True,
+            tokenizer_id,
+            use_fast=True
         )
         self.tokenizer.pad_token = self.pad_token
         self.streamer = TextStreamer(self.tokenizer)
@@ -97,13 +89,15 @@ class BitNet:
 
     def init_model(
             self,
+            model_path: str = None,
             flash: bool = False,
             verbose: bool = False
     ):
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
+            model_path,
             device_map="cpu",
-            dtype=self.dtype
+            dtype=self.dtype,
+            output_attentions=True,
         )
         self.model.eval()
 
@@ -134,22 +128,12 @@ class BitNet:
             self,
             text: str,
             max_new_tokens: int = 128,
-            speculative: bool = False,
+            assistant_model = None,
             num_assistant_tokens: int = None,
             assistant_confidence_threshold: float = None,
             stream: bool = False,
             verbose: bool = False,
     ) -> str:
-        quantized_model = None
-        if speculative:
-            quantized_model = AutoModelForCausalLM.from_pretrained(
-                "tiiuae/Falcon3-7B-Instruct-1.58bit-GGUF",
-                gguf_file=self.model_path,
-                device_map="cpu",
-                dtype=self.dtype
-            )
-            quantized_model.eval()
-
         start_time = time.time()
 
         inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=False).to(self.model.device)
@@ -160,15 +144,29 @@ class BitNet:
             pad_token_id=self.tokenizer.pad_token_id,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            use_cache=False,
-            # cache_implementation="quantized",
-            assistant_model=quantized_model,
+            use_cache=True,
+            assistant_model=assistant_model,
             num_assistant_tokens=num_assistant_tokens,
             assistant_confidence_threshold=assistant_confidence_threshold,
             streamer=self.streamer if stream else None,
             return_dict_in_generate=True,
             output_scores=verbose,
+            output_attentions=verbose
         )
+
+        # --- outputs 객체 구조 확인 시작 ---
+        print("\n--- outputs 객체 디버깅 정보 ---")
+        print(f"outputs 타입: {type(outputs)}")
+        print(f"outputs 속성: {dir(outputs)}")
+        if hasattr(outputs, 'sequences'):
+            print(f"outputs.sequences.shape: {outputs.sequences.shape}")
+        if hasattr(outputs, 'scores') and outputs.scores is not None:
+            print(f"outputs.scores 길이: {len(outputs.scores)}")
+            print(f"outputs.scores[0] 타입: {type(outputs.scores[0])}")
+            print(f"outputs.scores[0] shape (첫 번째 스코어 텐서): {outputs.scores[0].shape}")
+        print("--- outputs 객체 디버깅 정보 끝 ---\n")
+        # --- outputs 객체 구조 확인 끝 ---
+
         generated = outputs.sequences[0][input_len:]
         generated_text = self.tokenizer.decode(generated.tolist(), skip_special_tokens=False)
 
@@ -189,28 +187,37 @@ class BitNet:
             print(f"\033[94m💬 User Input:\033[0m\n{text}")
             print(f"\n\033[92m🟢 Generated Text:\033[0m\n{generated_text}")
             print("\n\033[94m📊 Timings:\033[0m")
-            print(f"  - Total Time: {total_time:.2f}s")
-            print(f"  - Decode: {decode_ms_per_token:.2f} ms/token, {decode_tokens_per_second:.2f} tokens/s")
+            print(f"├─ Total Time: {total_time:.2f}s")
+            print(f"└─ Decode: {decode_ms_per_token:.2f} ms/token, {decode_tokens_per_second:.2f} tokens/s")
             print(f"\033[94m📦 Tokens:\033[0m")
-            print(f"  - Prefilled: {num_input_tokens}")
-            print(f"  - Decoded: {num_generated_tokens}")
-            if speculative:
-                print(f"\033[94m✨ Speculative Decoding:\033[0m")
-                print(f"  - Assistant Tokens: {num_assistant_tokens}")
-                print(f"  - Acceptance Rate: {outputs.acceptance_rate * 100:.2f}%")
+            print(f"├─ Prefilled: {num_input_tokens}")
+            print(f"└─ Decoded: {num_generated_tokens}")
 
+            if assistant_model is not None:
+                print(f"\033[94m✨ Speculative Decoding:\033[0m")
+                
+            
             print("\n\033[95m" + "─" * 50)
             print("💡 Token Probabilities")
             print("─" * 50 + "\033[0m")
             print(f"| {'Step':>4s} | {'Token':<15s} | {'Probability':>12s} |")
             print(f"|{'-'*6}|{'-'*17}|{'-'*14}|")
 
-            probs = torch.stack([torch.softmax(s, dim=-1) for s in outputs.scores], dim=1).squeeze()
+            # Correctly extract main model scores for probability calculation
+            main_scores = []
+            if hasattr(outputs, "scores") and outputs.scores is not None:
+                for score_tuple in outputs.scores:
+                    # In speculative decoding, scores can be a tuple of (main_logits, draft_logits)
+                    # We only want the main_logits for the final probability.
+                    main_scores.append(score_tuple[0] if isinstance(score_tuple, tuple) else score_tuple)
 
-            for i, token_id in enumerate(generated):
-                token_prob = probs[i, token_id].item()
-                token_str = self.tokenizer.decode(token_id).replace('\n', '\\n')
-                print(f"| {i+1:>4d} | {token_str:<15.15s} | {token_prob:>12.2%} |")
+            if main_scores:
+                probs = torch.stack([torch.softmax(s, dim=-1) for s in main_scores], dim=1).squeeze(0)
+                for i, token_id in enumerate(generated):
+                    if i < probs.shape[0]:
+                        token_prob = probs[i, token_id].item()
+                        token_str = self.tokenizer.decode(token_id).replace('\n', '\\n')
+                        print(f"| {i+1:>4d} | {token_str:<15.15s} | {token_prob:>12.2%} |")
 
         return generated_text
 
@@ -257,11 +264,11 @@ class BitNet:
                 print(f"\033[94m💬 User Input:\033[0m\n{response_data.get('prompt', text)}")
                 print(f"\n\033[92m🟢 Generated Text:\033[0m\n{content}")
                 print("\n\033[94m📊 Timings:\033[0m")
-                print(f"  - Prefill: {timings.get('prompt_per_token_ms', 0):.2f} ms/token, {timings.get('prompt_per_second', 0):.2f} tokens/s")
-                print(f"  - Decode: {timings.get('predicted_per_token_ms', 0):.2f} ms/token, {timings.get('predicted_per_second', 0):.2f} tokens/s")
+                print(f"├─ Prefill: {timings.get('prompt_per_token_ms', 0):.2f} ms/token, {timings.get('prompt_per_second', 0):.2f} tokens/s")
+                print(f"└─ Decode: {timings.get('predicted_per_token_ms', 0):.2f} ms/token, {timings.get('predicted_per_second', 0):.2f} tokens/s")
                 print(f"\033[94m📦 Tokens:\033[0m")
-                print(f"  - Prefilled: {response_data.get('tokens_evaluated', 0)}")
-                print(f"  - Decoded: {response_data.get('tokens_predicted', 0)}")
+                print(f"├─ Prefilled: {response_data.get('tokens_evaluated', 0)}")
+                print(f"└─ Decoded: {response_data.get('tokens_predicted', 0)}")
                 print(f"\033[94m🛑 Stop Reason:\033[0m {response_data.get('stopping_word', 'N/A') or ('EOS' if response_data.get('stopped_eos') else 'Limit' if response_data.get('stopped_limit') else 'Unknown')}")
 
                 if 'completion_probabilities' in response_data and response_data['completion_probabilities']:
@@ -292,8 +299,8 @@ class BitNet:
         if verbose:
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("✨ Speculative Decoding")
-            print(f"├─ Target Model: {self.model_id}")
-            print(f"├─ Draft Model: {self.model_path}")
+            print(f"├─ Target Model: Falcon3-1B-Instruct")
+            print(f"├─ Draft Model: /Falcon3-1B-Instruct-i2_s")
             print(f"└─ Draft Length: {num_assistant_tokens}, Confidence: {confidence_threshold:.1f}")
             print("\033[95m" + "─" * 50 + "\033[0m")
 
@@ -444,3 +451,77 @@ class BitNet:
             print(f"└─ Total Accepted Draft Tokens: {total_accepted_draft_tokens}")
 
         return final_text
+
+    @torch.no_grad()
+    def speculative_decoding_hf(
+            self,
+            large_model,
+            text: str,
+            max_new_tokens: int = 128,
+            num_assistant_tokens: int = 4,
+            assistant_confidence_threshold: float = 0.4,
+            stream: bool = False,
+            verbose: bool = False,
+    ) -> str:
+        start_time = time.time()
+
+        inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=False).to(self.model.device)
+        input_len = inputs["input_ids"].shape[-1]
+
+        outputs = large_model.generate(
+            **inputs,
+            pad_token_id=self.tokenizer.pad_token_id,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            assistant_model=self.model,
+            num_assistant_tokens=num_assistant_tokens,
+            assistant_confidence_threshold=assistant_confidence_threshold,
+            streamer=self.streamer if stream else None,
+            return_dict_in_generate=True,
+            output_scores=verbose
+        )
+        print(outputs)
+        generated = outputs.sequences[0][input_len:]
+        generated_text = self.tokenizer.decode(generated.tolist(), skip_special_tokens=False)
+
+        end_time = time.time()
+
+        if verbose:
+            total_time = end_time - start_time
+            num_input_tokens = input_len
+            num_generated_tokens = len(generated)
+
+            decode_time = total_time
+            decode_tokens_per_second = num_generated_tokens / decode_time if decode_time > 0 else float('inf')
+            decode_ms_per_token = (decode_time * 1000) / num_generated_tokens if num_generated_tokens > 0 else 0
+
+            print("\n\033[95m" + "─" * 50)
+            print("🧠 Generation Info (Hugging Face)")
+            print("─" * 50 + "\033[0m")
+            print(f"\033[94m💬 User Input:\033[0m\n{text}")
+            print(f"\n\033[92m🟢 Generated Text:\033[0m\n{generated_text}")
+            print("\n\033[94m📊 Timings:\033[0m")
+            print(f"├─ Total Time: {total_time:.2f}s")
+            print(f"└─ Decode: {decode_ms_per_token:.2f} ms/token, {decode_tokens_per_second:.2f} tokens/s")
+            print(f"\033[94m📦 Tokens:\033[0m")
+            print(f"├─ Prefilled: {num_input_tokens}")
+            print(f"└─ Decoded: {num_generated_tokens}")
+            print(f"\033[94m✨ Speculative Decoding:\033[0m")
+            print(f"├─ Assistant Tokens: {num_assistant_tokens}")
+            print(f"└─ Acceptance Rate: {outputs.acceptance_rate * 100:.2f}%")
+
+            print("\n\033[95m" + "─" * 50)
+            print("💡 Token Probabilities")
+            print("─" * 50 + "\033[0m")
+            print(f"| {'Step':>4s} | {'Token':<15s} | {'Probability':>12s} |")
+            print(f"|{'-' * 6}|{'-' * 17}|{'-' * 14}|")
+
+            probs = torch.stack([torch.softmax(s, dim=-1) for s in outputs.scores], dim=1).squeeze()
+
+            for i, token_id in enumerate(generated):
+                token_prob = probs[i, token_id].item()
+                token_str = self.tokenizer.decode(token_id).replace('\n', '\\n')
+                print(f"| {i + 1:>4d} | {token_str:<15.15s} | {token_prob:>12.2%} |")
+
+        return generated_text
