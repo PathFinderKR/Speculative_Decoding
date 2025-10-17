@@ -263,9 +263,9 @@ class BitNet:
     def speculative_decoding(
             self,
             text: str,
-            max_new_tokens: int = 128,
-            num_assistant_tokens: int = 4,
-            confidence_threshold: float = 0.4,
+            max_new_tokens: int,
+            num_assistant_tokens: int,
+            confidence_threshold: float,
             seed: int = 42,
             verbose: bool = False,
     ):
@@ -426,9 +426,9 @@ class BitNet:
             self,
             small_model,
             text: str,
-            max_new_tokens: int = 128,
-            num_assistant_tokens: int = 4,
-            confidence_threshold: float = 0.4,
+            max_new_tokens: int,
+            num_assistant_tokens: int,
+            confidence_threshold: float,
             verbose: bool = False,
     ):
         if verbose:
