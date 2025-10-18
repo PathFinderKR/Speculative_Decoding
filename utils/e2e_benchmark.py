@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import pip
 import argparse
 import platform
 import subprocess
@@ -15,6 +16,13 @@ def run_command(command, shell=False, log_step=None):
             except subprocess.CalledProcessError as e:
                 logging.error(f"Error occurred while running command: {e}, check details in {log_file}")
                 sys.exit(1)
+    elif args.install_requirements:
+        try:
+            pip.main(['install', 'evaluate', 'datasets', 'accelerate'])
+            logging.info("Successfully installed required packages.")
+        except Exception as e:
+            logging.error(f"Failed to install packages: {e}")
+            sys.exit(1)
     else:
         try:
             subprocess.run(command, shell=shell, check=True)
@@ -51,6 +59,7 @@ def parse_args():
     parser.add_argument("-n", "--n-token", type=int, help="Number of generated tokens", required=False, default=128)
     parser.add_argument("-p", "--n-prompt", type=int, help="Prompt to generate text from", required=False, default=512)
     parser.add_argument("-t", "--threads", type=int, help="Number of threads to use", required=False, default=2)
+    parser.add_argument("--install-requirements", action='store_true', help="Install required python packages for evaluation.")
     return parser.parse_args()
 
 if __name__ == "__main__":
