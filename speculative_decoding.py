@@ -455,7 +455,7 @@ class BitNet:
             messages,
             return_tensors="pt",
             add_special_tokens=False
-        ).input_ids.to(self.model.device)
+        ).to(self.model.device)
         generated_token_ids = []
 
         # Generation loop
