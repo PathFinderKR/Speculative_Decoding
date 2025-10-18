@@ -5,7 +5,7 @@ import requests
 import json
 from typing import List, Dict, Optional
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer, StaticCache
 
 class BitNet:
     def __init__(self):
@@ -99,8 +99,7 @@ class BitNet:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map="cpu",
-            dtype=self.dtype,
-            output_attentions=True,
+            dtype=self.dtype
         )
         self.model.eval()
 
@@ -262,7 +261,7 @@ class BitNet:
     @torch.no_grad()
     def speculative_decoding(
             self,
-            text: str,
+            prompt: str,
             max_new_tokens: int,
             num_assistant_tokens: int,
             confidence_threshold: float,
@@ -283,8 +282,8 @@ class BitNet:
         total_accepted_draft_tokens = 0
 
         # Initial prompt
-        prompt_tokens = self.tokenizer(
-            text,
+        prompt_ids = self.tokenizer(
+            prompt,
             return_tensors="pt",
             add_special_tokens=False
         ).input_ids.to(self.model.device)
@@ -295,7 +294,7 @@ class BitNet:
         while len(generated_token_ids) < max_new_tokens:
             current_input_ids = torch.cat(
                 [
-                    prompt_tokens,
+                    prompt_ids,
                     torch.tensor([generated_token_ids], dtype=torch.long, device=self.model.device)
                 ],
                 dim=-1,
@@ -341,9 +340,9 @@ class BitNet:
                 print("\n" + "\033[95m" + "-" * 10 + f"Step {step}" + "-" * 10 + "\033[0m")
                 print(f"\033[94mDraft Input:\033[0m\n{current_text}")
                 print(f"\033[94mDraft Output\033[0m\n{self.tokenizer.decode(draft_ids.tolist(), skip_special_tokens=False)}")
-                print(f"┌{'─'*5}┬{'─'*17}┬{'─'*14}┬{'─'*20}┬{'─'*17}┐")
+                print(f"┌{'─' * 5}┬{'─' * 17}┬{'─' * 14}┬{'─' * 20}┬{'─' * 17}┐")
                 print(f"│ {'Idx':<3s} │ {'Draft Token':<15s} │ {'Target Prob':>12s} │ {'Status':<18s} │ {'Corrected':<15s} │")
-                print(f"├{'─'*5}┼{'─'*17}┼{'─'*14}┼{'─'*20}┼{'─'*17}┤")
+                print(f"├{'─' * 5}┼{'─' * 17}┼{'─' * 14}┼{'─' * 20}┼{'─' * 17}┤")
 
             accepted_count = 0
             for i in range(len(draft_ids)):
@@ -362,20 +361,19 @@ class BitNet:
                         status = "\033[92m✅ Accepted\033[0m"
                         corrected_str = "-"
                         print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15s} │")
-
                 else:
                     corrected_token = torch.argmax(target_logit, dim=-1).item()
+                    if accepted_count > 0:
+                        generated_token_ids.extend(draft_ids[:accepted_count].tolist())
+                    generated_token_ids.append(corrected_token)
+                    total_accepted_draft_tokens += accepted_count
                     if verbose:
                         corrected_str = self.tokenizer.decode(corrected_token).replace('\n', '\\n')
                         status = "\033[91m❌ Rejected\033[0m"
                         print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15.15s} │")
                         print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
-                    if accepted_count > 0:
-                        generated_token_ids.extend(draft_ids[:accepted_count].tolist())
-                    generated_token_ids.append(corrected_token)
-                    total_accepted_draft_tokens += accepted_count
                     break
-            else: # All draft tokens accepted
+            else:  # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
                 generated_token_ids.extend(draft_ids.tolist())
                 last_logit = logits[:, -1, :]
@@ -408,7 +406,7 @@ class BitNet:
 
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
-            print(f"\033[94m💬 User Input:\033[0m\n{text}")
+            print(f"\033[94m💬 User Input:\033[0m\n{prompt}")
             print(f"\n\033[92m🟢 Generated Text:\033[0m\n{final_text}")
             print("\n\033[94m📊 Performance:\033[0m")
             print(f"├─ Total Time: {total_time:.2f}s")
@@ -425,7 +423,7 @@ class BitNet:
     def speculative_decoding_hf(
             self,
             small_model,
-            text: str,
+            prompt: str,
             max_new_tokens: int,
             num_assistant_tokens: int,
             confidence_threshold: float,
@@ -445,8 +443,8 @@ class BitNet:
         total_accepted_draft_tokens = 0
 
         # Initial prompt
-        prompt_tokens = self.tokenizer(
-            text,
+        prompt_ids = self.tokenizer(
+            prompt,
             return_tensors="pt",
             add_special_tokens=False
         ).input_ids.to(self.model.device)
@@ -457,7 +455,7 @@ class BitNet:
         while len(generated_token_ids) < max_new_tokens:
             current_input_ids = torch.cat(
                 [
-                    prompt_tokens,
+                    prompt_ids,
                     torch.tensor([generated_token_ids], dtype=torch.long, device=self.model.device)
                 ],
                 dim=-1,
@@ -512,21 +510,19 @@ class BitNet:
                     if verbose:
                         status = "\033[92m✅ Accepted\033[0m"
                         corrected_str = "-"
-                        print(
-                            f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15s} │")
+                        print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15s} │")
 
                 else:
                     corrected_token = torch.argmax(target_logit, dim=-1).item()
-                    if verbose:
-                        corrected_str = self.tokenizer.decode(corrected_token).replace('\n', '\\n')
-                        status = "\033[91m❌ Rejected\033[0m"
-                        print(
-                            f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15.15s} │")
-                        print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
                     if accepted_count > 0:
                         generated_token_ids.extend(draft_ids[:accepted_count].tolist())
                     generated_token_ids.append(corrected_token)
                     total_accepted_draft_tokens += accepted_count
+                    if verbose:
+                        corrected_str = self.tokenizer.decode(corrected_token).replace('\n', '\\n')
+                        status = "\033[91m❌ Rejected\033[0m"
+                        print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15.15s} │")
+                        print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
                     break
             else:  # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
@@ -560,7 +556,7 @@ class BitNet:
 
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
-            print(f"\033[94m💬 User Input:\033[0m\n{text}")
+            print(f"\033[94m💬 User Input:\033[0m\n{prompt}")
             print(f"\n\033[92m🟢 Generated Text:\033[0m\n{final_text}")
             print("\n\033[94m📊 Performance:\033[0m")
             print(f"├─ Total Time: {total_time:.2f}s")
