@@ -261,7 +261,8 @@ class BitNet:
     @torch.no_grad()
     def speculative_decoding(
             self,
-            prompt: str,
+            system_prompt: str,
+            user_prompt: str,
             max_new_tokens: int,
             num_assistant_tokens: int,
             confidence_threshold: float,
@@ -281,14 +282,18 @@ class BitNet:
         total_draft_tokens = 0
         total_accepted_draft_tokens = 0
 
-        # Initial prompt
-        prompt_ids = self.tokenizer(
-            prompt,
+        # Format prompt
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt_ids = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
             return_tensors="pt",
-            add_special_tokens=False
-        ).input_ids.to(self.model.device)
+        ).to(self.model.device)
         generated_token_ids = []
-        past_key_values = None
 
         # Generation loop
         while len(generated_token_ids) < max_new_tokens:
@@ -327,14 +332,11 @@ class BitNet:
             verification_ids = torch.cat([
                 current_input_ids,
                 draft_ids.unsqueeze(0)
-            ], dim=-1)
-            outputs = self.model(
-                input_ids=verification_ids,
-                past_key_values=past_key_values,
-                use_cache=True
+                ],
+                dim=-1
             )
+            outputs = self.model(input_ids=verification_ids)
             logits = outputs.logits
-            past_key_values = outputs.past_key_values
 
             if verbose:
                 print("\n" + "\033[95m" + "-" * 10 + f"Step {step}" + "-" * 10 + "\033[0m")
@@ -406,7 +408,8 @@ class BitNet:
 
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
-            print(f"\033[94m💬 User Input:\033[0m\n{prompt}")
+            print(f"\033[94m💬 System prompt:\033[0m\n{system_prompt}")
+            print(f"\033[94m💬 User prompt:\033[0m\n{user_prompt}")
             print(f"\n\033[92m🟢 Generated Text:\033[0m\n{final_text}")
             print("\n\033[94m📊 Performance:\033[0m")
             print(f"├─ Total Time: {total_time:.2f}s")
@@ -423,7 +426,8 @@ class BitNet:
     def speculative_decoding_hf(
             self,
             small_model,
-            prompt: str,
+            system_prompt: str,
+            user_prompt: str,
             max_new_tokens: int,
             num_assistant_tokens: int,
             confidence_threshold: float,
@@ -442,14 +446,17 @@ class BitNet:
         total_draft_tokens = 0
         total_accepted_draft_tokens = 0
 
-        # Initial prompt
-        prompt_ids = self.tokenizer(
-            prompt,
+        # Format prompt
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt_ids = self.tokenizer.apply_chat_template(
+            messages,
             return_tensors="pt",
             add_special_tokens=False
         ).input_ids.to(self.model.device)
         generated_token_ids = []
-        past_key_values = None
 
         # Generation loop
         while len(generated_token_ids) < max_new_tokens:
@@ -477,13 +484,8 @@ class BitNet:
 
             # 2. Target Verification
             verification_ids = torch.cat([current_input_ids, draft_ids.unsqueeze(0)], dim=-1)
-            outputs = self.model(
-                input_ids=verification_ids,
-                past_key_values=past_key_values,
-                use_cache=True
-            )
+            outputs = self.model(input_ids=verification_ids)
             logits = outputs.logits
-            past_key_values = outputs.past_key_values
 
             if verbose:
                 current_text = self.tokenizer.decode(current_input_ids[0])
@@ -556,7 +558,8 @@ class BitNet:
 
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
-            print(f"\033[94m💬 User Input:\033[0m\n{prompt}")
+            print(f"\033[94m💬 System prompt:\033[0m\n{system_prompt}")
+            print(f"\033[94m💬 User prompt:\033[0m\n{user_prompt}")
             print(f"\n\033[92m🟢 Generated Text:\033[0m\n{final_text}")
             print("\n\033[94m📊 Performance:\033[0m")
             print(f"├─ Total Time: {total_time:.2f}s")
