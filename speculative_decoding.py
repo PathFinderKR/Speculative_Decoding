@@ -143,7 +143,7 @@ class BitNet:
             pad_token_id=self.tokenizer.pad_token_id,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            use_cache=True,
+            use_cache=False,
             streamer=self.streamer if stream else None,
             return_dict_in_generate=True,
             output_scores=verbose
