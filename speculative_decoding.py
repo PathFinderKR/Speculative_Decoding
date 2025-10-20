@@ -93,7 +93,6 @@ class BitNet:
     def init_model(
             self,
             model_path: str = None,
-            flash: bool = False,
             verbose: bool = False
     ):
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -143,7 +142,7 @@ class BitNet:
             pad_token_id=self.tokenizer.pad_token_id,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            use_cache=False,
+            use_cache=True,
             streamer=self.streamer if stream else None,
             return_dict_in_generate=True,
             output_scores=verbose
@@ -315,7 +314,7 @@ class BitNet:
                 min_p=0.0,
                 top_k=0,
                 seed=seed,
-                verbose=False,
+                verbose=False
             )
             draft_ids = self.tokenizer(
                 draft_text,
@@ -375,6 +374,7 @@ class BitNet:
                         print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15.15s} │")
                         print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
                     break
+
             else:  # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
                 generated_token_ids.extend(draft_ids.tolist())
@@ -526,6 +526,7 @@ class BitNet:
                         print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15.15s} │")
                         print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
                     break
+
             else:  # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
                 generated_token_ids.extend(draft_ids.tolist())
