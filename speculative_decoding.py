@@ -19,7 +19,6 @@ class BitNet:
         self.small_model = None
         self.pad_token = "<|pad|>"
         self.dtype = torch.float32
-        self.messages: List[Dict[str, str]] = []
         self.process: Optional[subprocess.Popen] = None
 
     def __del__(self):
@@ -93,11 +92,13 @@ class BitNet:
     def init_model(
             self,
             model_path: str = None,
+            device: str = "cuda",
+            flash: bool = False,
             verbose: bool = False
     ):
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            device_map="cpu",
+            device_map=device,
             dtype=self.dtype
         )
         self.model.eval()
@@ -374,7 +375,6 @@ class BitNet:
                         print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15.15s} │")
                         print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
                     break
-
             else:  # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
                 generated_token_ids.extend(draft_ids.tolist())
@@ -397,15 +397,14 @@ class BitNet:
             step += 1
 
         end_time = time.time()
+        total_time = end_time - start_time
         final_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=False)
+        num_generated = len(generated_token_ids)
+        acceptance_rate = (total_accepted_draft_tokens / total_draft_tokens) * 100 if total_draft_tokens > 0 else 0
+        latency = (total_time / num_generated) * 1000 if num_generated > 0 else float('inf')
+        throughput = num_generated / total_time if total_time > 0 else float('inf')
 
         if verbose:
-            total_time = end_time - start_time
-            num_generated = len(generated_token_ids)
-            acceptance_rate = (total_accepted_draft_tokens / total_draft_tokens) * 100 if total_draft_tokens > 0 else 0
-            latency = (total_time / num_generated) * 1000 if num_generated > 0 else float('inf')
-            throughput = num_generated / total_time if total_time > 0 else float('inf')
-
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
             print(f"\033[94m💬 System prompt:\033[0m\n{system_prompt}")
@@ -420,7 +419,12 @@ class BitNet:
             print(f"├─ Total Drafted Tokens: {total_draft_tokens}")
             print(f"└─ Total Accepted Draft Tokens: {total_accepted_draft_tokens}")
 
-        return final_text
+        return {
+            "text": final_text,
+            "latency": latency,
+            "throughput": throughput,
+            "acceptance_rate": acceptance_rate
+        }
 
     @torch.no_grad()
     def speculative_decoding_hf(
@@ -526,7 +530,6 @@ class BitNet:
                         print(f"│ {i + 1:<3d} │ {draft_token_str:<15.15s} │ {draft_token_prob:>12.2%} │ {status:<26s} │ {corrected_str:<15.15s} │")
                         print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
                     break
-
             else:  # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
                 generated_token_ids.extend(draft_ids.tolist())
@@ -549,14 +552,13 @@ class BitNet:
 
         end_time = time.time()
         final_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=False)
+        total_time = end_time - start_time
+        num_generated = len(generated_token_ids)
+        acceptance_rate = (total_accepted_draft_tokens / total_draft_tokens) * 100 if total_draft_tokens > 0 else 0
+        latency = (total_time / num_generated) * 1000 if num_generated > 0 else float('inf')
+        throughput = num_generated / total_time if total_time > 0 else float('inf')
 
         if verbose:
-            total_time = end_time - start_time
-            num_generated = len(generated_token_ids)
-            acceptance_rate = (total_accepted_draft_tokens / total_draft_tokens) * 100 if total_draft_tokens > 0 else 0
-            latency = (total_time / num_generated) * 1000 if num_generated > 0 else float('inf')
-            throughput = num_generated / total_time if total_time > 0 else float('inf')
-
             print("\n" + "\033[95m" + "─" * 50 + "\033[0m")
             print("🏁 Speculative Decoding Finished")
             print(f"\033[94m💬 System prompt:\033[0m\n{system_prompt}")
@@ -571,4 +573,9 @@ class BitNet:
             print(f"├─ Total Drafted Tokens: {total_draft_tokens}")
             print(f"└─ Total Accepted Draft Tokens: {total_accepted_draft_tokens}")
 
-        return final_text
+        return {
+            "text": final_text,
+            "latency": latency,
+            "throughput": throughput,
+            "acceptance_rate": acceptance_rate
+        }
