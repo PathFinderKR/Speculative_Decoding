@@ -291,12 +291,7 @@ class BitNet:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        prompt_ids = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_tensors="pt",
-        ).to(self.model.device)
+        prompt_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, return_tensors="pt").to(self.model.device)
 
         step = 1
         total_draft_tokens = 0
@@ -312,7 +307,7 @@ class BitNet:
             draft_text = self.generate_gguf(
                 text=current_text,
                 max_new_tokens=num_assistant_tokens,
-                temperature=0.0,
+                temperature=1.0,
                 top_p=1.0,
                 min_p=0.0,
                 top_k=0,
@@ -324,6 +319,7 @@ class BitNet:
             if len(draft_ids) == 0:
                 if verbose: print("⚠️ Draft model produced no new tokens. Stopping.")
                 break
+
             total_draft_tokens += len(draft_ids)
 
             # 2. Target Verification
