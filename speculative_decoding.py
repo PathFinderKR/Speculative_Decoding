@@ -3,9 +3,9 @@ import subprocess
 import time
 import requests
 import json
-from typing import List, Dict, Optional
+from typing import List, Optional
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer, StaticCache
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 
 class BitNet:
     def __init__(self):
@@ -28,7 +28,7 @@ class BitNet:
             self,
             bitnet_path: str,
             ctx_size: int = 1024,
-            n_threads: int = 12,
+            n_threads: int = 8,
             batch_size: int = 1,
             host: str = "127.0.0.1",
             port: int = 8080,
@@ -99,7 +99,8 @@ class BitNet:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map=device,
-            dtype=self.dtype
+            dtype=self.dtype,
+            attn_implementation="eager",
         )
         self.model.eval()
 
@@ -130,6 +131,9 @@ class BitNet:
             self,
             text: str,
             max_new_tokens: int = 128,
+            small_model=None,
+            num_assistant_tokens: int = 4,
+            confidence_threshold: float = 0.4,
             stream: bool = False,
             verbose: bool = False,
     ) -> str:
@@ -142,6 +146,9 @@ class BitNet:
             **inputs,
             pad_token_id=self.tokenizer.pad_token_id,
             max_new_tokens=max_new_tokens,
+            assistant_model=small_model,
+            num_assistant_tokens=num_assistant_tokens if small_model is not None else 0,
+            assistant_confidence_threshold=confidence_threshold if small_model is not None else 0.0,
             do_sample=False,
             use_cache=True,
             streamer=self.streamer if stream else None,
@@ -152,16 +159,15 @@ class BitNet:
         generated_text = self.tokenizer.decode(generated.tolist(), skip_special_tokens=False)
 
         end_time = time.time()
+        total_time = end_time - start_time
+        num_input_tokens = input_len
+        num_generated_tokens = len(generated)
+
+        decode_time = total_time
+        decode_tokens_per_second = num_generated_tokens / decode_time if decode_time > 0 else float('inf')
+        decode_ms_per_token = (decode_time * 1000) / num_generated_tokens if num_generated_tokens > 0 else 0
 
         if verbose:
-            total_time = end_time - start_time
-            num_input_tokens = input_len
-            num_generated_tokens = len(generated)
-
-            decode_time = total_time
-            decode_tokens_per_second = num_generated_tokens / decode_time if decode_time > 0 else float('inf')
-            decode_ms_per_token = (decode_time * 1000) / num_generated_tokens if num_generated_tokens > 0 else 0
-
             print("\n\033[95m" + "─" * 50)
             print("🧠 Generation Info (Hugging Face)")
             print("─" * 50 + "\033[0m")
@@ -293,6 +299,11 @@ class BitNet:
             tokenize=True,
             return_tensors="pt",
         ).to(self.model.device)
+        prompt_out = self.model(
+            input_ids=prompt_ids,
+            use_cache=True
+        )
+        prompt_cache = prompt_out.past_key_values
         generated_token_ids = []
 
         # Generation loop
@@ -336,7 +347,7 @@ class BitNet:
                 dim=-1
             )
             outputs = self.model(input_ids=verification_ids)
-            logits = outputs.logits
+
 
             if verbose:
                 print("\n" + "\033[95m" + "-" * 10 + f"Step {step}" + "-" * 10 + "\033[0m")
@@ -349,7 +360,7 @@ class BitNet:
             accepted_count = 0
             for i in range(len(draft_ids)):
                 # 1. Probabilities
-                target_logit = logits[:, current_input_ids.shape[-1] + i - 1, :]
+                target_logit = outputs.logits[:, current_input_ids.shape[-1] + i - 1, :]
                 probs = torch.softmax(target_logit, dim=-1)
 
                 draft_token_id = draft_ids[i]
@@ -378,7 +389,7 @@ class BitNet:
             else:  # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
                 generated_token_ids.extend(draft_ids.tolist())
-                last_logit = logits[:, -1, :]
+                last_logit = outputs.logits[:, -1, :]
                 next_token = torch.argmax(last_logit, dim=-1).item()
                 generated_token_ids.append(next_token)
                 if verbose:
@@ -415,6 +426,7 @@ class BitNet:
             print(f"├─ Latency: {latency:.2f} ms/token")
             print(f"└─ Throughput: {throughput:.2f} tokens/s")
             print(f"\033[94m✨ Speculative Stats:\033[0m")
+            print(f"├─ Total Generated Tokens: {num_generated}")
             print(f"├─ Acceptance Rate: {acceptance_rate:.2f}%")
             print(f"├─ Total Drafted Tokens: {total_draft_tokens}")
             print(f"└─ Total Accepted Draft Tokens: {total_accepted_draft_tokens}")
@@ -569,6 +581,7 @@ class BitNet:
             print(f"├─ Latency: {latency:.2f} ms/token")
             print(f"└─ Throughput: {throughput:.2f} tokens/s")
             print(f"\033[94m✨ Speculative Stats:\033[0m")
+            print(f"├─ Total Generated Tokens: {num_generated}")
             print(f"├─ Acceptance Rate: {acceptance_rate:.2f}%")
             print(f"├─ Total Drafted Tokens: {total_draft_tokens}")
             print(f"└─ Total Accepted Draft Tokens: {total_accepted_draft_tokens}")
