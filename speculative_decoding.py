@@ -6,6 +6,7 @@ import json
 from typing import List, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+from transformers.cache_utils import DynamicCache
 
 class BitNet:
     def __init__(self):
@@ -284,9 +285,6 @@ class BitNet:
             print("\033[95m" + "─" * 50 + "\033[0m")
 
         start_time = time.time()
-        step = 1
-        total_draft_tokens = 0
-        total_accepted_draft_tokens = 0
 
         # Format prompt
         messages = [
@@ -299,23 +297,16 @@ class BitNet:
             tokenize=True,
             return_tensors="pt",
         ).to(self.model.device)
-        prompt_out = self.model(
-            input_ids=prompt_ids,
-            use_cache=True
-        )
-        prompt_cache = prompt_out.past_key_values
-        generated_token_ids = []
+
+        step = 1
+        total_draft_tokens = 0
+        total_accepted_draft_tokens = 0
+        generated_ids = []
 
         # Generation loop
-        while len(generated_token_ids) < max_new_tokens:
-            current_input_ids = torch.cat(
-                [
-                    prompt_ids,
-                    torch.tensor([generated_token_ids], dtype=torch.long, device=self.model.device)
-                ],
-                dim=-1,
-            )
-            current_text = self.tokenizer.decode(current_input_ids[0])
+        while len(generated_ids) < max_new_tokens:
+            current_ids = torch.cat([prompt_ids, torch.tensor([generated_ids], dtype=torch.long, device=self.model.device)], dim=-1)
+            current_text = self.tokenizer.decode(current_ids[0])
 
             # 1. Draft Generation
             draft_text = self.generate_gguf(
@@ -328,11 +319,7 @@ class BitNet:
                 seed=seed,
                 verbose=False
             )
-            draft_ids = self.tokenizer(
-                draft_text,
-                return_tensors="pt",
-                add_special_tokens=False
-            ).input_ids[0].to(self.model.device)
+            draft_ids = self.tokenizer(draft_text, return_tensors="pt", add_special_tokens=False).input_ids[0].to(self.model.device)
 
             if len(draft_ids) == 0:
                 if verbose: print("⚠️ Draft model produced no new tokens. Stopping.")
@@ -340,14 +327,8 @@ class BitNet:
             total_draft_tokens += len(draft_ids)
 
             # 2. Target Verification
-            verification_ids = torch.cat([
-                current_input_ids,
-                draft_ids.unsqueeze(0)
-                ],
-                dim=-1
-            )
-            outputs = self.model(input_ids=verification_ids)
-
+            verification_ids = torch.cat([current_ids, draft_ids.unsqueeze(0)], dim=-1)
+            outputs = self.model(input_ids=verification_ids, use_cache=False)
 
             if verbose:
                 print("\n" + "\033[95m" + "-" * 10 + f"Step {step}" + "-" * 10 + "\033[0m")
@@ -360,7 +341,7 @@ class BitNet:
             accepted_count = 0
             for i in range(len(draft_ids)):
                 # 1. Probabilities
-                target_logit = outputs.logits[:, current_input_ids.shape[-1] + i - 1, :]
+                target_logit = outputs.logits[:, current_ids.shape[-1] + i - 1, :]
                 probs = torch.softmax(target_logit, dim=-1)
 
                 draft_token_id = draft_ids[i]
@@ -377,8 +358,8 @@ class BitNet:
                 else:
                     corrected_token = torch.argmax(target_logit, dim=-1).item()
                     if accepted_count > 0:
-                        generated_token_ids.extend(draft_ids[:accepted_count].tolist())
-                    generated_token_ids.append(corrected_token)
+                        generated_ids.extend(draft_ids[:accepted_count].tolist())
+                    generated_ids.append(corrected_token)
                     total_accepted_draft_tokens += accepted_count
                     if verbose:
                         corrected_str = self.tokenizer.decode(corrected_token).replace('\n', '\\n')
@@ -388,10 +369,10 @@ class BitNet:
                     break
             else:  # All draft tokens accepted
                 total_accepted_draft_tokens += accepted_count
-                generated_token_ids.extend(draft_ids.tolist())
+                generated_ids.extend(draft_ids.tolist())
                 last_logit = outputs.logits[:, -1, :]
                 next_token = torch.argmax(last_logit, dim=-1).item()
-                generated_token_ids.append(next_token)
+                generated_ids.append(next_token)
                 if verbose:
                     print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 20}┴{'─' * 17}┘")
                     accepted_token_strs = [self.tokenizer.decode(t).replace('\n', '\\n') for t in draft_ids.tolist()]
@@ -399,9 +380,9 @@ class BitNet:
                     print(f"✅ \033[92mAccepted all {accepted_count} tokens: \033[0m{accepted_token_strs}")
                     print(f"✅ \033[92mGenerated Target Token: \033[0m{next_token_str}")
 
-            if self.tokenizer.eos_token_id in generated_token_ids:
-                eos_index = generated_token_ids.index(self.tokenizer.eos_token_id)
-                generated_token_ids = generated_token_ids[:eos_index]
+            if self.tokenizer.eos_token_id in generated_ids:
+                eos_index = generated_ids.index(self.tokenizer.eos_token_id)
+                generated_token_ids = generated_ids[:eos_index]
                 if verbose: print("🛑 EOS token generated. Stopping.")
                 break
 
@@ -409,8 +390,8 @@ class BitNet:
 
         end_time = time.time()
         total_time = end_time - start_time
-        final_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=False)
-        num_generated = len(generated_token_ids)
+        final_text = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+        num_generated = len(generated_ids)
         acceptance_rate = (total_accepted_draft_tokens / total_draft_tokens) * 100 if total_draft_tokens > 0 else 0
         latency = (total_time / num_generated) * 1000 if num_generated > 0 else float('inf')
         throughput = num_generated / total_time if total_time > 0 else float('inf')
