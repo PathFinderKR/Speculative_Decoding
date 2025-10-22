@@ -236,7 +236,7 @@ class BitNet:
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
-            use_cache=False,
+            use_cache=True,
             assistant_model=small_model,
             num_assistant_tokens=num_assistant_tokens,
             assistant_early_exit=assistant_early_exit,
@@ -330,7 +330,6 @@ class BitNet:
                     input_ids=prefix[0].tolist(),
                     max_new_tokens=num_assistant_tokens,
                     temperature=0.0, top_p=1.0, min_p=0.0, top_k=0, seed=seed,
-                    slot_id=2,
                     verbose=False
                 )
                 draft_ids = self.tokenizer(
@@ -360,17 +359,15 @@ class BitNet:
 
             if verbose:
                 print("\n" + "\033[95m" + "-" * 10 + f"Step {step}" + "-" * 10 + "\033[0m")
-                print(f"┌{'─' * 5}┬{'─' * 17}┬{'─' * 14}┬{'─' * 17}┬{'─' * 17}┐")
-                print(f"│ {'Idx':<3s} │ {'Draft Token':<15s} │ {'Target Prob':>12s} │ {'Status':<15s} │ {'Corrected':<15s} │")
-                print(f"├{'─' * 5}┼{'─' * 17}┼{'─' * 14}┼{'─' * 17}┼{'─' * 17}┤")
+                print(f"┌{'─' * 5}┬{'─' * 17}┬{'─' * 17}┬{'─' * 17}┐")
+                print(f"│ {'Idx':<3s} │ {'Draft Token':<15s} │ {'Status':<15s} │ {'Corrected':<15s} │")
+                print(f"├{'─' * 5}┼{'─' * 17}┼{'─' * 17}┼{'─' * 17}┤")
 
             accepted_count = 0
             for i in range(draft_ids.shape[0]):
                 target_logit = logits[:, L + i - 1, :] if (L + i - 1) >= 0 else logits[:, 0, :]
-                probs = torch.softmax(target_logit, dim=-1)
 
                 draft_token_id = draft_ids[i].item()
-                p = probs[0, draft_token_id].item()
                 top1_id = torch.argmax(target_logit, dim=-1).item()
 
                 accept = (top1_id == draft_token_id)
@@ -378,7 +375,7 @@ class BitNet:
                     accepted_count += 1
                     if verbose:
                         tok_str = self.tokenizer.decode([draft_token_id]).replace('\n', '\\n')
-                        print(f"│ {i + 1:<3d} │ {tok_str:<15.15s} │ {p:>12.2%} │ \033[92m✅ Accepted\033[0m     │ {'-':<15s} │")
+                        print(f"│ {i + 1:<3d} │ {tok_str:<15.15s} │ \033[92m✅ Accepted\033[0m     │ {'-':<15s} │")
                 else:
                     if accepted_count > 0:
                         generated_ids.extend(draft_ids[:accepted_count].tolist())
@@ -389,8 +386,8 @@ class BitNet:
                     if verbose:
                         tok_str = self.tokenizer.decode([draft_token_id]).replace('\n', '\\n')
                         corr_str = self.tokenizer.decode([corrected]).replace('\n', '\\n')
-                        print(f"│ {i + 1:<3d} │ {tok_str:<15.15s} │ {p:>12.2%} │ \033[91m❌ Rejected\033[0m     │ {corr_str:<15.15s} │")
-                        print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 17}┴{'─' * 17}┘")
+                        print(f"│ {i + 1:<3d} │ {tok_str:<15.15s} │ \033[91m ❌ Rejected\033[0m     │ {corr_str:<15.15s} │")
+                        print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 17}┴{'─' * 17}┘")
 
                     break
 
@@ -404,7 +401,7 @@ class BitNet:
 
                 if verbose:
                     next_token_str = self.tokenizer.decode([next_token]).replace('\n', '\\n')
-                    print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 14}┴{'─' * 17}┴{'─' * 17}┘")
+                    print(f"└{'─' * 5}┴{'─' * 17}┴{'─' * 17}┴{'─' * 17}┘")
                     print(f"✅ \033[92mAdded 1 target token\033[0m: {next_token_str}")
 
             if self.tokenizer.eos_token_id in generated_ids:
